@@ -88,8 +88,7 @@ counts <- read_delim(counts.file,
 # Import metadata
 metadata <- read_csv(meta.file,
                      show_col_types = FALSE) %>% 
-  dplyr::mutate(lib.size = colSums(counts),
-                cell_line = factor(cell_line,
+  dplyr::mutate(cell_line = factor(cell_line,
                                    levels = c("JVM3", "HG3", "MEC1")),
                 group = factor(group,
                                levels = c("U1_wt", "U1_mut")),
@@ -120,11 +119,26 @@ genes_edb <- genes_edb %>%
 # Filter counts by existing genes and samples order
 counts <- counts[as.character(genes_edb$entrezid),metadata$sample_id]
 
+# Calculate TPMs
+tpms <- counts %>% 
+  as_tibble(rownames = "entrezid") %>% 
+  tidyr::pivot_longer(cols = -entrezid,
+                      names_to = "sample",
+                      values_to = "raw_counts") %>% 
+  dplyr::group_by(sample) %>% 
+  dplyr::mutate(rate = log(raw_counts) - log(genes_edb$length),
+                denom = log(sum(exp(rate))),
+                tpm = exp(rate - denom + log(1e6))) %>% 
+  dplyr::ungroup() %>% 
+  dplyr::select(-rate, -denom, -raw_counts) %>% 
+  tidyr::pivot_wider(names_from = sample,
+                     values_from = tpm)
+
 # Create the DGE matrix
 dge_matrix <- DGEList(counts = counts,
-                      lib.size = metadata$lib.size,
+                      lib.size = colSums(counts),
                       norm.factors = normLibSizes(counts, method = "TMM"),
-                      samples = metadata %>% dplyr::select(-group, -lib.size),
+                      samples = metadata %>% dplyr::select(-group),
                       group = metadata$group,
                       genes = genes_edb)
 
@@ -148,17 +162,15 @@ colnames(counts$counts) <- basename(salmon_files)
 counts$annotation <- counts$annotation %>% 
   janitor::clean_names() %>% 
   tibble::rownames_to_column(var = "txid") %>% 
-  dplyr::mutate(txid = stringr::str_split_i(txid, '\\.', 1))
-  
+  dplyr::mutate(txid = stringr::str_split_i(txid, '\\.', 1)) %>% 
+  dplyr::select(-length) %>% 
+  dplyr::rename(length = effective_length)
+
 # Import metadata
-metadata <- read_csv(meta.file,
+metadata <- read_csv('metadata_salmon.csv',
                      show_col_types = FALSE) %>% 
   dplyr::mutate(lib.size = colSums(counts$counts),
-                cell_line = factor(cell_line,
-                                   levels = c("JVM3", "HG3", "MEC1")),
-                group = factor(group,
-                               levels = c("U1_wt", "U1_mut")),
-                label = glue::glue("{cell_line}_{replicate}_{group}"))
+                label = glue::glue("{group}_{replicate}"))
 
 # Complete gene annotations
 genes_edb <- AnnotationDbi::select(edb,
@@ -178,19 +190,34 @@ counts$annotation <- counts$annotation %>%
 # Filter counts by samples order
 counts$counts <- counts$counts[counts$annotation$txid,metadata$sample_id]
 
+# Calculate TPMs
+tpms <- counts$counts %>% 
+  as_tibble(rownames = "txid") %>% 
+  tidyr::pivot_longer(cols = -txid,
+                      names_to = "sample",
+                      values_to = "raw_counts") %>% 
+  dplyr::group_by(sample) %>% 
+  dplyr::mutate(rate = log(raw_counts) - log(counts$annotation$length),
+                denom = log(sum(exp(rate))),
+                tpm = exp(rate - denom + log(1e6))) %>% 
+  dplyr::ungroup() %>% 
+  dplyr::select(-rate, -denom, -raw_counts) %>% 
+  tidyr::pivot_wider(names_from = sample,
+                     values_from = tpm)
+
 ## Mapping-based quantification
 dge_matrix <- DGEList(counts = counts$counts/counts$annotation$Overdispersion,
-                      lib.size = metadata$lib.size,
+                      lib.size = colSums(counts$counts),
                       norm.factors = normLibSizes(counts$counts, method = "TMM"),
-                      samples = metadata %>% dplyr::select(-group, -lib.size),
+                      samples = metadata %>% dplyr::select(-group),
                       group = metadata$group,
                       genes = counts$annotation %>% dplyr::select(-Overdispersion))
 
 ## Alignment-based quantification
 dge_matrix <- DGEList(counts = counts$counts,
-                      lib.size = metadata$lib.size,
+                      lib.size = colSums(counts$counts),
                       norm.factors = normLibSizes(counts$counts, method = "TMM"),
-                      samples = metadata %>% dplyr::select(-group, -lib.size),
+                      samples = metadata %>% dplyr::select(-group),
                       group = metadata$group,
                       genes = counts$annotation %>% dplyr::select(-Overdispersion))
 
@@ -210,10 +237,10 @@ counts <- purrr::map(salmon_files, \(x){
   read_delim(file.path(x, 'quant.genes.sf'),
              delim = '\t',
              show_col_types = FALSE) %>% 
-    dplyr::rename(!!glue::glue("{basename(x)}_Length") := Length,
+    dplyr::rename(!!glue::glue("{basename(x)}_Length") := EffectiveLength,
                   !!glue::glue("{basename(x)}_TPM") := TPM,
                   !!basename(x) := NumReads) %>% 
-    dplyr::select(-EffectiveLength)}) %>% 
+    dplyr::select(-Length)}) %>% 
   purrr::reduce(\(x, y) dplyr::left_join(x, y, by = "Name")) %>% 
   dplyr::mutate(Name = stringr::str_split_i(Name, '\\.', 1))
 
@@ -239,14 +266,9 @@ counts <- counts %>%
   tibble::column_to_rownames("Name")
 
 # Import metadata
-metadata <- read_csv(meta.file,
+metadata <- read_csv('metadata_salmon.csv',
                      show_col_types = FALSE) %>% 
-  dplyr::mutate(lib.size = colSums(counts),
-                cell_line = factor(cell_line,
-                                   levels = c("JVM3", "HG3", "MEC1")),
-                group = factor(group,
-                               levels = c("U1_wt", "U1_mut")),
-                label = glue::glue("{cell_line}_{replicate}_{group}"))
+  dplyr::mutate(label = glue::glue("{group}_{replicate}"))
 
 # Complete gene annotations
 genes_edb <- AnnotationDbi::select(edb,
@@ -261,16 +283,19 @@ genes_edb <- AnnotationDbi::select(edb,
                                 symbol))
 genes <- genes %>% 
   dplyr::inner_join(genes_edb, by = "geneid") %>% 
-  dplyr::filter(geneid %in% rownames(counts))
+  dplyr::filter(geneid %in% rownames(counts)) %>% 
+  dplyr::distinct(geneid, .keep_all = TRUE)
 
 # Filter counts by existing genes and samples order
 counts <- counts[genes$geneid,metadata$sample_id]
+tpms <- tpms %>% 
+  dplyr::filter(geneid %in% genes$geneid)
 
 # Create the DGE matrix
 dge_matrix <- DGEList(counts = counts,
-                      lib.size = metadata$lib.size,
+                      lib.size = colSums(counts),
                       norm.factors = normLibSizes(counts, method = "TMM"),
-                      samples = metadata %>% dplyr::select(-group, -lib.size),
+                      samples = metadata %>% dplyr::select(-group),
                       group = metadata$group,
                       genes = genes)
 
@@ -1327,15 +1352,10 @@ edgeR_fit_test$table %>%
 #| include: false
 
 # Calculate TPMs
-tpms <- as_tibble(dge_matrix$counts,
-                  rownames = "entrezid") %>% 
-  dplyr::mutate(len = dge_matrix$genes$length) %>% 
-  tidyr::pivot_longer(cols = -c(entrezid, len),
+mean_tpms <- tpms %>% 
+  tidyr::pivot_longer(cols = -entrezid,
                       names_to = "sample",
-                      values_to = "counts") %>% 
-  dplyr::group_by(sample) %>% 
-  dplyr::mutate(counts_len = counts / len,
-                tpm = counts_len * 1e6 / sum(counts_len)) %>% 
+                      values_to = "tpm") %>% 
   dplyr::group_by(entrezid) %>% 
   dplyr::summarise(tpm = mean(tpm),
                    .groups = "drop")
@@ -1349,7 +1369,7 @@ dge_results <- as_tibble(edgeR_fit_test$table,
   dplyr::left_join(as_tibble(as.data.frame(is.de), rownames = "entrezid") %>% 
                      dplyr::rename(down_up = colnames(.)[2]),
                    by = "entrezid") %>% 
-  dplyr::left_join(tpms,
+  dplyr::left_join(mean_tpms,
                    by = "entrezid") %>% 
   dplyr::mutate(pvalue_BH = p.adjust(PValue, method = "BH"),
                 pvalue_bonferroni = p.adjust(PValue, method = "bonferroni")) %>% 
@@ -1561,15 +1581,10 @@ tibble(logCPM = limma_fit_test$Amean,
 #| include: false
 
 # Calculate TPMs
-tpms <- as_tibble(dge_matrix$counts,
-                  rownames = "entrezid") %>% 
-  dplyr::mutate(len = dge_matrix$genes$length) %>% 
-  tidyr::pivot_longer(cols = -c(entrezid, len),
+mean_tpms <- tpms %>% 
+  tidyr::pivot_longer(cols = -entrezid,
                       names_to = "sample",
-                      values_to = "counts") %>% 
-  dplyr::group_by(sample) %>% 
-  dplyr::mutate(counts_len = counts / len,
-                tpm = counts_len * 1e6 / sum(counts_len)) %>% 
+                      values_to = "tpm") %>% 
   dplyr::group_by(entrezid) %>% 
   dplyr::summarise(tpm = mean(tpm),
                    .groups = "drop")
@@ -1585,7 +1600,7 @@ dge_results <- bind_cols(limma_fit_test$genes,
   dplyr::left_join(as_tibble(as.data.frame(is.de), rownames = "entrezid") %>% 
                      dplyr::rename(down_up = colnames(.)[2]),
                    by = "entrezid") %>% 
-  dplyr::left_join(tpms,
+  dplyr::left_join(mean_tpms,
                    by = "entrezid") %>% 
   dplyr::mutate(pvalue_BH = p.adjust(pvalue, method = "BH"),
                 pvalue_bonferroni = p.adjust(pvalue, method = "bonferroni")) %>% 
