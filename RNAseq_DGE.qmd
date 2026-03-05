@@ -167,7 +167,7 @@ counts$annotation <- counts$annotation %>%
   dplyr::rename(length = effective_length)
 
 # Import metadata
-metadata <- read_csv('metadata_salmon.csv',
+metadata <- read_csv(meta.file,
                      show_col_types = FALSE) %>% 
   dplyr::mutate(lib.size = colSums(counts$counts),
                 label = glue::glue("{group}_{replicate}"))
@@ -178,13 +178,15 @@ genes_edb <- AnnotationDbi::select(edb,
                                    keytype = "TXID",
                                    columns = c("TXID", "GENEID", "SYMBOL", "ENTREZID")) %>% 
   janitor::clean_names() %>% 
-  dplyr::distinct(entrezid, .keep_all = TRUE) %>% 
-  dplyr::mutate(symbol = ifelse(is.na(symbol) | symbol == "", entrezid, symbol),
-                symbol = ifelse(duplicated(symbol),
-                                glue::glue("{symbol}_{entrezid}"),
-                                symbol))
+  dplyr::filter(!is.na(entrezid)) %>%
+  dplyr::group_by(symbol) %>% 
+  dplyr::mutate(n = n()) %>% 
+  dplyr::ungroup() %>% 
+  dplyr::mutate(symbol = case_when(is.na(symbol) | symbol == "" ~ txid,
+                                   n > 1 ~ glue::glue("{symbol}_{txid}"),
+                                   .default = symbol))
 counts$annotation <- counts$annotation %>% 
-  dplyr::left_join(genes_edb, by = "txid") %>% 
+  dplyr::inner_join(genes_edb, by = "txid") %>% 
   dplyr::distinct(txid, .keep_all = TRUE)
 
 # Filter counts by samples order
@@ -206,12 +208,12 @@ tpms <- counts$counts %>%
                      values_from = tpm)
 
 ## Mapping-based quantification
-dge_matrix <- DGEList(counts = counts$counts/counts$annotation$Overdispersion,
+dge_matrix <- DGEList(counts = counts$counts/counts$annotation$overdispersion,
                       lib.size = colSums(counts$counts),
                       norm.factors = normLibSizes(counts$counts, method = "TMM"),
                       samples = metadata %>% dplyr::select(-group),
                       group = metadata$group,
-                      genes = counts$annotation %>% dplyr::select(-Overdispersion))
+                      genes = counts$annotation %>% dplyr::select(-overdispersion))
 
 ## Alignment-based quantification
 dge_matrix <- DGEList(counts = counts$counts,
@@ -219,7 +221,7 @@ dge_matrix <- DGEList(counts = counts$counts,
                       norm.factors = normLibSizes(counts$counts, method = "TMM"),
                       samples = metadata %>% dplyr::select(-group),
                       group = metadata$group,
-                      genes = counts$annotation %>% dplyr::select(-Overdispersion))
+                      genes = counts$annotation %>% dplyr::select(-overdispersion))
 
 # Clean the environment
 rm(list = c("meta.file", "salmon.dir", "ah", "edb", "counts", "genes_edb"))
@@ -266,7 +268,7 @@ counts <- counts %>%
   tibble::column_to_rownames("Name")
 
 # Import metadata
-metadata <- read_csv('metadata_salmon.csv',
+metadata <- read_csv(meta.file,
                      show_col_types = FALSE) %>% 
   dplyr::mutate(label = glue::glue("{group}_{replicate}"))
 
