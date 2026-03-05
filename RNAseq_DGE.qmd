@@ -1,0 +1,1806 @@
+---
+title: "Differential gene expression analysis"
+subtitle: "Default protocol - 2026/02/09"
+editor: visual
+format:
+  html:
+    theme: spacelab
+    toc: true
+    toc-location: left
+    toc-title: "Steps"
+    self-contained: true
+execute:
+  cache: true
+---
+
+```{r}
+#| label: libraries
+#| include: false
+#| cache: false
+
+# Data manipulation
+library(qs2)
+library(readr)
+library(dplyr)
+library(scales)
+
+# Databases
+library(AnnotationHub)
+
+# Differential expression analysis
+library(edgeR)
+library(limma)
+
+# Data visualization
+library(ggplot2)
+library(ggnewscale)
+library(ggrepel)
+library(RColorBrewer)
+library(PCAtools)
+library(ComplexHeatmap)
+
+# Markdown
+library(DT)
+```
+
+```{r}
+#| label: load-annotations
+#| include: false
+#| cache: true
+
+# Load Ensembl annotations
+ah <- AnnotationHub()
+## Human
+# query(ah, c('Homo sapiens', 'Ensembl'))
+edb <- ah[["AH119325"]] #Human Ensembl version 113
+## Mouse
+# query(ah, c('Mus musculus', 'Ensembl'))
+# edb <- ah[["AH119358"]] #Mouse Ensembl version 113
+```
+
+```{r}
+#| label: paths
+#| echo: false
+
+prefix <- '20260209_default_protocol'
+meta.file <- 'metadata.csv'
+counts.file <- 'GSE134197_raw_counts_GRCh38.p13_NCBI.tsv'
+salmon.dir <- 'salmon'
+out.dir <- 'default_results'
+
+if(!(dir.exists(out.dir))){
+    dir.create(out.dir)
+  }
+```
+
+## Data
+
+```{r}
+#| label: build-DGEmatrix
+#| include: false
+
+# Import count matrix manually
+counts <- read_delim(counts.file,
+                     delim = '\t',
+                     show_col_types = FALSE) %>% 
+  tibble::column_to_rownames("GeneID")
+
+# Import metadata
+metadata <- read_csv(meta.file,
+                     show_col_types = FALSE) %>% 
+  dplyr::mutate(cell_line = factor(cell_line,
+                                   levels = c("JVM3", "HG3", "MEC1")),
+                group = factor(group,
+                               levels = c("U1_wt", "U1_mut")),
+                label = glue::glue("{cell_line}_{replicate}_{group}"))
+
+# Generate gene annotations
+genes_edb <- AnnotationDbi::select(edb,
+                                   keys = as.character(rownames(counts)),
+                                   keytype = "ENTREZID",
+                                   columns = c("GENEID", "SYMBOL", "ENTREZID")) %>% 
+  janitor::clean_names() %>% 
+  dplyr::distinct(entrezid, .keep_all = TRUE) %>% 
+  dplyr::mutate(symbol = ifelse(is.na(symbol) | symbol == "", entrezid, symbol),
+                symbol = ifelse(duplicated(symbol),
+                                glue::glue("{symbol}_{entrezid}"),
+                                symbol))
+genes_length <- GenomicFeatures::transcriptLengths(edb,
+                                                   filter = GeneIdFilter(genes_edb$geneid)) %>%
+  dplyr::distinct(gene_id, .keep_all = TRUE) %>% 
+  dplyr::select(gene_id, tx_len) %>% 
+  dplyr::rename(geneid = gene_id,
+                length = tx_len)
+genes_edb <- genes_edb %>% 
+  dplyr::inner_join(genes_length,
+                   by = "geneid") %>% 
+  dplyr::filter(entrezid %in% rownames(counts))
+
+# Filter counts by existing genes and samples order
+counts <- counts[as.character(genes_edb$entrezid),metadata$sample_id]
+
+# Calculate TPMs
+tpms <- counts %>% 
+  as_tibble(rownames = "entrezid") %>% 
+  tidyr::pivot_longer(cols = -entrezid,
+                      names_to = "sample",
+                      values_to = "raw_counts") %>% 
+  dplyr::group_by(sample) %>% 
+  dplyr::mutate(rate = log(raw_counts) - log(genes_edb$length),
+                denom = log(sum(exp(rate))),
+                tpm = exp(rate - denom + log(1e6))) %>% 
+  dplyr::ungroup() %>% 
+  dplyr::select(-rate, -denom, -raw_counts) %>% 
+  tidyr::pivot_wider(names_from = sample,
+                     values_from = tpm)
+
+# Create the DGE matrix
+dge_matrix <- DGEList(counts = counts,
+                      lib.size = colSums(counts),
+                      norm.factors = normLibSizes(counts, method = "TMM"),
+                      samples = metadata %>% dplyr::select(-group),
+                      group = metadata$group,
+                      genes = genes_edb)
+
+# Clean the environment
+rm(list = c("meta.file", "counts.file", "ah", "edb", "counts", "genes_edb", "genes_length"))
+```
+
+```{r}
+#| label: build-DGEmatrix-salmon-tx
+#| include: false
+#| eval: false
+
+# Import salmon transcript counts
+salmon_files <- list.files(salmon.dir,
+                           full.names = TRUE)
+counts <- catchSalmon(salmon_files)
+## Clean counts
+rownames(counts$counts) <- stringr::str_split_i(rownames(counts$counts), '\\.', 1)
+colnames(counts$counts) <- basename(salmon_files)
+## Clean annotations
+counts$annotation <- counts$annotation %>% 
+  janitor::clean_names() %>% 
+  tibble::rownames_to_column(var = "txid") %>% 
+  dplyr::mutate(txid = stringr::str_split_i(txid, '\\.', 1)) %>% 
+  dplyr::select(-length) %>% 
+  dplyr::rename(length = effective_length)
+
+# Import metadata
+metadata <- read_csv(meta.file,
+                     show_col_types = FALSE) %>% 
+  dplyr::mutate(lib.size = colSums(counts$counts),
+                label = glue::glue("{group}_{replicate}"))
+
+# Complete gene annotations
+genes_edb <- AnnotationDbi::select(edb,
+                                   keys = counts$annotation$txid,
+                                   keytype = "TXID",
+                                   columns = c("TXID", "GENEID", "SYMBOL", "ENTREZID")) %>% 
+  janitor::clean_names() %>% 
+  dplyr::filter(!is.na(entrezid)) %>%
+  dplyr::group_by(symbol) %>% 
+  dplyr::mutate(n = n()) %>% 
+  dplyr::ungroup() %>% 
+  dplyr::mutate(symbol = case_when(is.na(symbol) | symbol == "" ~ txid,
+                                   n > 1 ~ glue::glue("{symbol}_{txid}"),
+                                   .default = symbol))
+counts$annotation <- counts$annotation %>% 
+  dplyr::inner_join(genes_edb, by = "txid") %>% 
+  dplyr::distinct(txid, .keep_all = TRUE)
+
+# Filter counts by samples order
+counts$counts <- counts$counts[counts$annotation$txid,metadata$sample_id]
+
+# Calculate TPMs
+tpms <- counts$counts %>% 
+  as_tibble(rownames = "txid") %>% 
+  tidyr::pivot_longer(cols = -txid,
+                      names_to = "sample",
+                      values_to = "raw_counts") %>% 
+  dplyr::group_by(sample) %>% 
+  dplyr::mutate(rate = log(raw_counts) - log(counts$annotation$length),
+                denom = log(sum(exp(rate))),
+                tpm = exp(rate - denom + log(1e6))) %>% 
+  dplyr::ungroup() %>% 
+  dplyr::select(-rate, -denom, -raw_counts) %>% 
+  tidyr::pivot_wider(names_from = sample,
+                     values_from = tpm)
+
+## Mapping-based quantification
+dge_matrix <- DGEList(counts = counts$counts/counts$annotation$overdispersion,
+                      lib.size = colSums(counts$counts),
+                      norm.factors = normLibSizes(counts$counts, method = "TMM"),
+                      samples = metadata %>% dplyr::select(-group),
+                      group = metadata$group,
+                      genes = counts$annotation %>% dplyr::select(-overdispersion))
+
+## Alignment-based quantification
+dge_matrix <- DGEList(counts = counts$counts,
+                      lib.size = colSums(counts$counts),
+                      norm.factors = normLibSizes(counts$counts, method = "TMM"),
+                      samples = metadata %>% dplyr::select(-group),
+                      group = metadata$group,
+                      genes = counts$annotation %>% dplyr::select(-overdispersion))
+
+# Clean the environment
+rm(list = c("meta.file", "salmon.dir", "ah", "edb", "counts", "genes_edb"))
+```
+
+```{r}
+#| label: build-DGEmatrix-salmon-genes
+#| include: false
+#| eval: false
+
+# Import count matrix manually
+salmon_files <- list.files(salmon.dir,
+                           full.names = TRUE)
+counts <- purrr::map(salmon_files, \(x){
+  read_delim(file.path(x, 'quant.genes.sf'),
+             delim = '\t',
+             show_col_types = FALSE) %>% 
+    dplyr::rename(!!glue::glue("{basename(x)}_Length") := EffectiveLength,
+                  !!glue::glue("{basename(x)}_TPM") := TPM,
+                  !!basename(x) := NumReads) %>% 
+    dplyr::select(-Length)}) %>% 
+  purrr::reduce(\(x, y) dplyr::left_join(x, y, by = "Name")) %>% 
+  dplyr::mutate(Name = stringr::str_split_i(Name, '\\.', 1))
+
+## Extract gene information
+genes <- counts %>% 
+  dplyr::select(Name, ends_with("_Length")) %>% 
+  tidyr::pivot_longer(-Name,
+                      names_to = "sample",
+                      values_to = "length") %>% 
+  dplyr::group_by(Name) %>% 
+  dplyr::summarise(length = mean(length),
+                   .groups = "drop") %>% 
+  dplyr::rename(geneid = Name)
+
+## Extract TPMs
+tpms <- counts %>% 
+  dplyr::select(Name, ends_with("_TPM"))
+colnames(tpms) <- c("geneid", list.files(salmon.dir))
+
+## Generate the count matrix
+counts <- counts %>% 
+  dplyr::select(Name, all_of(list.files(salmon.dir))) %>% 
+  tibble::column_to_rownames("Name")
+
+# Import metadata
+metadata <- read_csv(meta.file,
+                     show_col_types = FALSE) %>% 
+  dplyr::mutate(label = glue::glue("{group}_{replicate}"))
+
+# Complete gene annotations
+genes_edb <- AnnotationDbi::select(edb,
+                                   keys = genes$geneid,
+                                   keytype = "GENEID",
+                                   columns = c("GENEID", "SYMBOL", "ENTREZID")) %>% 
+  janitor::clean_names() %>% 
+  dplyr::distinct(entrezid, .keep_all = TRUE) %>% 
+  dplyr::mutate(symbol = ifelse(is.na(symbol) | symbol == "", entrezid, symbol),
+                symbol = ifelse(duplicated(symbol),
+                                glue::glue("{symbol}_{entrezid}"),
+                                symbol))
+genes <- genes %>% 
+  dplyr::inner_join(genes_edb, by = "geneid") %>% 
+  dplyr::filter(geneid %in% rownames(counts)) %>% 
+  dplyr::distinct(geneid, .keep_all = TRUE)
+
+# Filter counts by existing genes and samples order
+counts <- counts[genes$geneid,metadata$sample_id]
+tpms <- tpms %>% 
+  dplyr::filter(geneid %in% genes$geneid)
+
+# Create the DGE matrix
+dge_matrix <- DGEList(counts = counts,
+                      lib.size = colSums(counts),
+                      norm.factors = normLibSizes(counts, method = "TMM"),
+                      samples = metadata %>% dplyr::select(-group),
+                      group = metadata$group,
+                      genes = genes)
+
+# Clean the environment
+rm(list = c("meta.file", "salmon.dir", "ah", "edb", "counts", "genes_edb", "genes"))
+```
+
+These are the samples that are going to be analyzed:
+
+```{r}
+#| label: table-metadata
+#| echo: false
+
+metadata %>% 
+  tibble::column_to_rownames("label") %>% 
+  DT::datatable(rownames = TRUE,
+                options = list(
+                  pageLength = 10,
+                  lengthMenu = c(10, 15, 20, 50, 100),
+                  scrollX = TRUE,
+                  initComplete = JS(
+                    "function(settings, json) {",
+                    "$(this.api().table().header()).css({'font-size': '14px'});",
+                    "}"))) %>% 
+  DT::formatStyle(columns = c(0:(ncol(metadata)-1)),
+                  fontSize = '14px')
+```
+
+```{r}
+#| label: save-raw-counts
+#| include: false
+
+# Save raw counts
+write_delim(as_tibble(dge_matrix$counts, rownames = "geneid") ,
+            file = glue::glue("{out.dir}/{prefix}_raw_counts.tsv"),
+            delim = "\t")
+```
+
+## Data pre-processing
+
+```{r}
+#| label: color-palette
+#| include: false
+
+# Create a sample palette
+if (length(metadata$label) > 10){
+    mycol <- colorRampPalette(ggsci::pal_npg("nrc")(10))(length(metadata$label))
+} else {
+    mycol <- ggsci::pal_npg("nrc")(length(metadata$label))
+}
+
+# Create a PCA/Heatmap palette
+annotations <- data.frame(row.names = metadata$label,
+                          cell_line = metadata$cell_line,
+                          u1 = metadata$group)
+annotation_colors = list(u1 = c(U1_mut = "#fe5f55", U1_wt = "#577399"),
+                         cell_line = c(JVM3 = "#94d2bd", HG3 = "#e9d8a6", MEC1 = "#ee9b00"))
+```
+
+```{r}
+#| label: define-design
+#| include: false
+
+# Guide to understand matrices: https://bioconductor.org/packages/release/workflows/vignettes/RNAseq123/inst/doc/designmatrices.html
+design <- model.matrix(~0 + metadata$group)
+colnames(design) <- levels(metadata$group)
+
+# Make the contrast matrix
+contr.matrix <- makeContrasts(
+  MUTvsWT = U1_mut - U1_wt,
+  levels  = colnames(design))
+```
+
+```{r}
+#| label: explanation-1
+#| include: false
+
+# The log-RPKM values will be used for exploratory plots. When log=TRUE, then a small count, given by prior.count but scaled to be proportional to the library size, is added to avoid taking the log of zero, which also reduces spurious variability for genes with very low counts by shrinking all the inter-sample log-fold-changes towards zero, something that is helpful for exploratory plotting.
+
+# Log-RPKM values are also used in downstream linear modeling via limma's voom function, although voom recomputes its own log-RPKM values internally with a smaller prior count.
+
+# From doi: 10.1093/nar/gkaf018
+
+# Filtering is done partly because very low expressed genes are of little biological interest and because NB-dispersion estimation is unreliable for such genes. The main reason however is that genes with too few reads cannot achieve statistical significance even if they truly are differentially abundant. Keeping such genes in the downstream analysis increases the amount of multiple testing and decreases statistical power without any compensating advantage.
+```
+
+```{r}
+#| label: compute-logRPKM
+#| include: false
+
+# Compute reads per kilobase per million (RPKM)
+lrpkm <- rpkm(dge_matrix,
+              normalized.lib.sizes = TRUE,
+              gene.length	= "length",
+              log = TRUE)
+```
+
+### Number of expressed genes
+
+```{r}
+#| label: filter-expression
+#| include: false
+
+# Calculate lowly expressed genes
+keep.exprs <- filterByExpr(dge_matrix,
+                           design = design)
+
+# Plot number of expressed genes
+gg_tmp <- as_tibble(dge_matrix$counts) %>% 
+  dplyr::mutate(status = ifelse(rowSums(. == 0) == ncol(.),
+                                'Unexpressed',
+                                'Expressed'),
+                status = ifelse(!keep.exprs & status == "Expressed", 
+                                "Very lowly\nexpressed",
+                                status)) %>% 
+  dplyr::count(status) %>% 
+  dplyr::mutate(perc = n/sum(n),
+                ymax = cumsum(perc), #top of each rectangle
+                ymin = lag(ymax, default = 0)) %>% #bottom of each rectangle 
+  dplyr::group_by(status) %>% 
+  dplyr::mutate(label_position = mean(c(ymax, ymin))) %>% 
+  dplyr::ungroup()
+```
+
+There are `r format(sum(gg_tmp %>% dplyr::filter(status != "Expressed") %>% dplyr::pull(n)), big.mark = ',')` (`r round(sum(gg_tmp %>% dplyr::filter(status != "Expressed") %>% dplyr::pull(perc))*100,2)`%) genes that are either not expressed at all in any sample or expressed at very low levels, and will be removed from the analysis. These genes are primarily non-coding or tissue-specific.
+
+```{r}
+#| label: gg-expressed-genes
+#| echo: false
+#| fig.width: 5
+#| fig.height: 5
+#| fig.align: center
+
+gg_tmp %>% 
+  ggplot(aes(ymax = ymax, ymin = ymin, xmax = 4, xmin = 3, color = status)) +
+  geom_rect(aes(fill = status, alpha = status)) +
+  scale_color_manual(values = c("#065E60", "#ee9b00", "#bb3e03")) +
+  scale_fill_manual(values = c("#0a9396", "#ee9b00", "#bb3e03")) +
+  scale_alpha_manual(values = c(0.8, 0.3, 0.3)) +
+  new_scale_fill() +
+  geom_label(x = 3, #x here controls label position (inner / outer)
+             aes(y = label_position,
+                 label = glue::glue("{label_percent()(perc)}\n{status}\n{format(n, big.mark = ',')} genes")),
+             fill = 'white',
+             size = 4,
+             alpha = 1,
+             fontface = "bold") + 
+  coord_polar(theta="y") +
+  xlim(c(-1, 4)) +
+  annotate("text",
+           x = 0, y = 0, size = 6,
+           label = glue::glue("\n\n\nGene\nexpression")) +
+  theme_void() +
+  theme(legend.position = "")
+
+rm(gg_tmp)
+```
+
+### Removing poorly expressed genes
+
+In the following plot we can see the three peaks that corresponds with: not expressed genes, genes with very low expression and genes with normal to high expression levels.
+
+```{r}
+#| label: explanation-2
+#| include: false
+
+# Genes that do not have a worthwhile number of reads in any sample should be filtered out of the downstream analyses. There are several reasons for this. From a biological point of view, genes that not expressed at a biologically meaningful level in any condition are not of interest and are therefore best ignored. From a statistical point of view, removing low count genes allows the mean-variance relationship in the data to be estimated with greater reliability and also reduces the number of statistical tests that need to be carried out in downstream analyses looking at differential expression.
+```
+
+```{r}
+#| label: gg-filter-expression-1
+#| echo: false
+#| fig.width: 11
+#| fig.height: 6
+#| fig.align: center
+
+# Raw data
+## Thresholds
+L <- mean(dge_matrix$samples$lib.size) * 1e-6
+M <- median(dge_matrix$samples$lib.size) * 1e-6
+lrpkm.cutoff <- log2(10/M + 2/L)
+
+## Plot
+as_tibble(lrpkm,
+          rownames = "gene_id") %>% 
+  tidyr::pivot_longer(cols = -gene_id,
+                      names_to = "samples",
+                      values_to = "values") %>% 
+  ggplot(aes(x = values,
+           colour = samples)) + 
+  geom_density() +
+  geom_vline(xintercept = lrpkm.cutoff,
+             linetype = "dashed") +
+  scale_color_manual(values = mycol) +
+  ylim(0,0.25) +
+  labs(title = "Expression distribution - Raw data",
+       x = "Log-RPKM",
+       y = "Density") +
+  theme_bw() +
+  theme(plot.title = element_text(size = 20, hjust = 0.5),
+        axis.text = element_text(size = 13),
+        axis.title= element_text(size = 16),
+        legend.position = "")
+```
+
+After removing poorly expressed genes, we get a negatively skewed normal distribution with most of the genes having a normal expression of 3-4 log-RPKMs.
+
+```{r}
+#| label: gg-filter-expression-2
+#| echo: false
+#| fig.width: 11
+#| fig.height: 6
+#| fig.align: center
+
+# Filtered data
+## Filter lowly expressed genes and compute the RPKMs again
+dge_matrix <- dge_matrix[keep.exprs,
+                         keep.lib.sizes = FALSE]
+lrpkm <- rpkm(dge_matrix,
+              normalized.lib.sizes = TRUE,
+              gene.length	= "length",
+              log = TRUE)
+
+## Plot
+as_tibble(lrpkm,
+          rownames = "gene_id") %>% 
+  tidyr::pivot_longer(cols = -gene_id,
+                      names_to = "samples",
+                      values_to = "values") %>% 
+  ggplot(aes(x = values,
+           colour = samples)) + 
+  geom_density() +
+  geom_vline(xintercept = lrpkm.cutoff,
+             linetype = "dashed") +
+  scale_color_manual(values = mycol) +
+  ylim(0,0.25) +
+  labs(title = "Expression distribution - Filtered data",
+       x = "Log-RPKM",
+       y = "Density") +
+  theme_bw() +
+  theme(plot.title = element_text(size = 20, hjust = 0.5),
+        axis.text = element_text(size = 13),
+        axis.title= element_text(size = 16),
+        legend.position = "")
+```
+
+### Normalizing gene expression distributions
+
+We also normalized the data by library size to correct for small differences among the samples.
+
+```{r}
+#| label: explanation-3
+#| include: false
+
+# During sample preparation or sequencing process, external factors that are not of biological interest can affect the expression of individual samples. For example, samples processed in the first batch of an experiment can have higher expression overall when compared to samples processed in a second batch. It is assumed that all samples should have a similar range and distribution of expression values. Normalization is required to ensure that the expression distributions of each sample are similar across the entire experiment.
+
+# From doi: 10.1093/nar/gkaf018
+# TMM (trimmed mean of M-values) is the default normalization method but a new TMMwsp method (TMM with singleton pairing) has been added to provide more robust behaviour for sparse data with many zeros. The TMM method discards genes with zero count in either library when comparing each library to the reference library. TMMwsp rescues genes with a positive count in just one of the two libraries (a singleton) by pairing them up with another gene with a singleton count in the other library
+
+## normLibSizes doesn’t normalize the data, it just calculates normalization factors for use downstream
+```
+
+```{r}
+#| label: gg-normalize-expression
+#| echo: false
+#| fig.width: 11
+#| fig.height: 6
+#| fig.align: center
+
+# Re-calculate normalization factors after removing lowly expressed genes
+dge_matrix <- normLibSizes(dge_matrix, method = "TMM")
+lrpkm <- rpkm(dge_matrix,
+              normalized.lib.sizes = TRUE,
+              gene.length	= "length",
+              log = TRUE)
+
+## Density plot
+as_tibble(lrpkm,
+          rownames = "gene_id") %>% 
+  tidyr::pivot_longer(cols = -gene_id,
+                      names_to = "samples",
+                      values_to = "values") %>% 
+  ggplot(aes(x = values,
+           colour = samples)) + 
+  geom_density() +
+  geom_vline(xintercept = lrpkm.cutoff,
+             linetype = "dashed") +
+  scale_color_manual(values = mycol) +
+  ylim(0,0.25) +
+  labs(title = "Expression distribution - Filtered and normalized data",
+       x = "Log-RPKM",
+       y = "Density") +
+  theme_bw() +
+  theme(plot.title = element_text(size = 22),
+        axis.text = element_text(size = 13),
+        axis.title= element_text(size = 16),
+        legend.position = "")
+
+## Boxplot
+as_tibble(lrpkm,
+          rownames = "Genes") %>% 
+  tidyr::pivot_longer(cols = -Genes,
+                      names_to = "samples",
+                      values_to = "values") %>% 
+  dplyr::mutate(samples = factor(samples,
+                                 levels = metadata$sample_id)) %>% 
+  ggplot(aes(x = samples,
+             y = values,
+             fill = samples)) + 
+  geom_boxplot() + 
+  scale_fill_manual(values = alpha(mycol, 0.7)) +
+  labs(title = "Expression distribution - Filtered and normalized data",
+       y = "Log-RPKM",
+       x = "") +
+  theme_bw() +
+  theme(plot.title = element_text(size = 20, hjust = 0.5),
+        axis.text = element_text(size = 13, angle = 45, hjust = 1),
+        axis.title= element_text(size = 16),
+        legend.position = "")
+```
+
+```{r}
+#| label: save-normalized-DGEmatrix
+#| echo: false
+
+# Save DGEmatrix object
+qs_save(dge_matrix, file = glue::glue("{out.dir}/dge_matrix.qs2"))
+
+# Clean the environment
+rm(list = c("keep.exprs", "L", "M", "lrpkm.cutoff"))
+```
+
+## Unsupervised clustering of samples
+
+In this section we perform some exploratory analyses just to check if our samples cluster according to the different expected conditions, and also to check if there are any batch effects that need to be removed before differential expression analysis. For this purpose, we will use PCA, heatmap and a heatmap of sample-to-sample distances:
+
+### PCA
+
+Considering the first two PCs (93% of explained variability), samples separate by cell line instead of the studied condition, the status of U1. This means we have a huge (and expected) batch effect in our analysis.
+
+```{r}
+#| label: gg-pca
+#| echo: false
+#| warning: false
+#| message: false
+#| error: false
+#| fig.width: 11
+#| fig.height: 6
+#| fig.align: center
+
+# PCA plot
+## Get the matrix distance and dimensional values
+rownames(lrpkm) <- dge_matrix$genes$symbol
+m <- as.matrix(lrpkm)
+pca_m <- pca(m)
+pca_m$metadata <- annotations
+
+## Plot
+biplot(pca_m,
+       showLoadings = TRUE,
+       sizeLoadingsNames = 4,
+       colLoadingsNames = "red4",
+       lengthLoadingsArrowsFactor = 1,
+       alphaLoadingsArrow = 0.8,
+       lab = NULL,
+       pointSize = 4.5,
+       colby = "u1",
+       colkey = annotation_colors$u1,
+       shape = "cell_line",
+       encircle = TRUE,
+       gridlines.minor = FALSE,
+       legendPosition = "right",
+       legendLabSize = 15,
+       legendTitleSize = 19,
+       legendIconSize = 3,
+       labSize = 5) +
+  labs(title = "PCA",
+       color = "Cell line",
+       shape = "U1 status") +
+  theme_bw() +
+  theme(plot.title = element_text(size = 20, hjust = 0.5),
+        axis.title = element_text(size = 16),
+        axis.text = element_text(size = 13),
+        panel.grid.major.x = element_blank(),
+        panel.grid.minor.y = element_blank(),
+        legend.title = element_text(size = 15),
+        legend.text = element_text(size = 12))
+
+## Scree-plot
+as_tibble(pca_m$variance,
+                 rownames = "pca") %>% 
+  dplyr::filter(value >= 1) %>% 
+  dplyr::mutate(sum = cumsum(value),
+                group = 1,
+                pca = factor(pca, 
+                             levels = pca)) %>% 
+  ggplot(aes(x = pca, y = value)) +
+  geom_bar(stat = "identity",
+           position = "dodge",
+           fill = "#00b4d8",
+           alpha = 0.6,
+           color = "black") +
+  geom_point(aes(x = pca, y = sum),
+             size = 4) +
+  geom_line(aes(x = pca, y = sum, group = group),
+            color = "#023e8a",
+            linewidth = 2) +
+  geom_hline(yintercept = 80,
+             linetype = "dashed",
+             linewidth = 1.2) +
+  ylim(c(0, 105)) +
+  labs(title = "Scree plot",
+       x = "",
+       y = "Proportion of explained variance (%)") +
+  theme_bw() +
+  theme(plot.title = element_text(size = 20, hjust = 0.5),
+        axis.title = element_text(size = 16),
+        axis.text = element_text(size = 13, angle = 45, hjust = 1),
+        panel.grid.major.x = element_blank(),
+        panel.grid.minor.y = element_blank())
+
+# Clean the environment
+rm(list = c("m", "pca_m"))
+```
+
+### Heatmap
+
+To generate the heatmap, we used the top 200 most variable genes in the dataset, which allows us to confirm what we saw in the PCA.
+
+```{r}
+#| label: gg-heatmap
+#| echo: false
+#| warnings: false
+#| fig.width: 10
+#| fig.height: 6
+#| fig.align: center
+
+# Heatmap
+lrpkm_var <- apply(lrpkm, 1, var)
+topgenes <- names(lrpkm_var[order(lrpkm_var, decreasing = T)][1:200])
+
+## Scale by row
+topmat_scaled <- t(scale(t(lrpkm[topgenes,])))
+
+Heatmap(topmat_scaled,
+        cluster_rows = TRUE,
+        cluster_columns = TRUE,
+        # Split columns
+        column_split = annotations$u1,
+        cluster_column_slices = FALSE,
+        column_title_gp = gpar(fontsize = 12),
+        # Text
+        show_row_names = FALSE,
+        show_column_names = TRUE,
+        column_names_gp = gpar(fontsize = 10),
+        column_names_rot = 45,
+        # Legend
+        heatmap_legend_param = list(title = "Expression\n(Log-RPKM)",
+                                    title_gp = gpar(fontsize = 11),
+                                    labels_gp = gpar(fontsize = 10)),
+        # Annotations
+        top_annotation = HeatmapAnnotation(df = annotations,
+                                           col = annotation_colors,
+                                           annotation_legend_param = list(title_gp = gpar(fontsize = 11),
+                                                                          labels_gp = gpar(fontsize = 10)),
+                                           annotation_name_gp = gpar(fontsize = 11)),
+        # External border
+        border = TRUE,
+        border_gp = gpar(lwd = 0.5),
+        # Cell border
+        rect_gp = gpar(col = NA),
+        # Cell size
+        width = ncol(topmat_scaled)*unit(12, "mm"), 
+        # Expression color
+        col = circlize::colorRamp2(range(topmat_scaled), c("#E4E1E3FF", "#0072B2")))
+
+# Clean the environment
+rm(list = c("topmat_scaled", "topgenes", "lrpkm_var"))
+```
+
+### Heatmap of sample-to-sample distances
+
+Finally, the heatmap of sample-to-sample distances is another way to explore the data, showing how similar or different the samples are from each other. This plot is complementary to the previous heatmap.
+
+```{r}
+#| label: gg-heatmap-sample2sample
+#| echo: false
+#| warnings: false
+#| fig.width: 10
+#| fig.height: 6
+#| fig.align: center
+
+# Heatmap of sample-to-sample distances
+## Calculate the distance matrix
+MDS_res <- plotMDS(lrpkm,
+                   top = 1000,
+                   labels = dge_matrix$samples$group,
+                   gene.selection = "pairwise",
+                   plot = FALSE)
+
+## Plot
+Heatmap(MDS_res$distance.matrix,
+        cluster_rows = TRUE,
+        cluster_columns = TRUE,
+        # Text
+        column_title = "Heatmap of sample-to-sample distances",
+        column_title_gp = gpar(fontsize = 14),
+        show_row_names = FALSE,
+        show_column_names = FALSE,
+        # Legend
+        heatmap_legend_param = list(title = "Sample-to-sample\ndistance",
+                                    title_gp = gpar(fontsize = 11),
+                                    labels_gp = gpar(fontsize = 10)),
+        # Annotations
+        top_annotation = HeatmapAnnotation(df = annotations,
+                                           col = annotation_colors,
+                                           annotation_name_gp = gpar(fontsize = 11),
+                                           annotation_legend_param = list(title_gp = gpar(fontsize = 11),
+                                                                          labels_gp = gpar(fontsize = 10))),
+        left_annotation = rowAnnotation(df = annotations,
+                                        col = annotation_colors,
+                                        show_legend = FALSE,
+                                        show_annotation_name = FALSE),
+        # External border
+        border = TRUE,
+        border_gp = gpar(lwd = 0.5),
+        # Cell border
+        rect_gp = gpar(col = NA),
+        # Size
+        width = ncol(MDS_res$distance.matrix) * unit(8, "mm"),
+        height = nrow(MDS_res$distance.matrix) * unit(8, "mm"),
+        # Colors
+        col = circlize::colorRamp2(range(MDS_res$distance.matrix),rev(brewer.pal(9, "Blues"))[c(1,9)]))
+
+# Clean the environment
+rm(list = c("MDS_res"))
+```
+
+## Removing Batch effect
+
+As we have seen before, the cell line of origin is a huge batch effect. If we do the analysis without removing it, we will probably identify genes deferentially expressed between them, instead of between our U1 status condition.
+
+```{r}
+#| label: explanation-4
+#| include: false
+
+# Batch effect. There's an important difference between removing a batch effect and modeling a batch effect. Including the batch in your design formula will model the batch effect in the regression step, which means that the raw data are not modified (so the batch effect is not removed), but instead the regression will estimate the size of the batch effect and subtract it out when performing all other tests. In addition, the model's residual degrees of freedom will be reduced appropriately to reflect the fact that some degrees of freedom were "spent" modeling the batch effects. This is the preferred approach for any method that is capable of using it (this includes DESeq2). You would only remove the batch effect (e.g. using limma's removeBatchEffect function) if you were going to do some kind of downstream analysis that can't model the batch effects, such as training a classifier.
+```
+
+```{r}
+#| label: calculate-batcheffect
+#| include: false
+
+# Batch effect calculation
+lrpkm_withoutBatch <- removeBatchEffect(lrpkm,
+                                        design = design,
+                                        batch  = metadata$cell_line)
+```
+
+After removing the cell line batch effect, we can see in both the PCA and the heatmaps that now the samples cluster much better by the U1 status condition.
+
+::: panel-tabset
+### PCA
+
+```{r}
+#| label: gg-pca-nobatch
+#| echo: false
+#| warning: false
+#| message: false
+#| error: false
+#| fig.width: 11
+#| fig.height: 6
+#| fig.align: center
+
+# PCA plot
+## Get the matrix distance and dimensional values
+m <- as.matrix(lrpkm_withoutBatch)
+pca_m <- pca(m)
+pca_m$metadata <- annotations
+
+## Plot
+biplot(pca_m,
+       showLoadings = TRUE,
+       sizeLoadingsNames = 4,
+       colLoadingsNames = "red4",
+       lengthLoadingsArrowsFactor = 1,
+       alphaLoadingsArrow = 0.8,
+       lab = NULL,
+       pointSize = 4.5,
+       colby = "u1",
+       colkey = annotation_colors$u1,
+       shape = "cell_line",
+       encircle = TRUE,
+       gridlines.minor = FALSE,
+       legendPosition = "right",
+       legendLabSize = 15,
+       legendTitleSize = 19,
+       legendIconSize = 3,
+       labSize = 5) +
+  labs(title = "PCA",
+       color = "Cell line",
+       shape = "U1 status") +
+  theme_bw() +
+  theme(plot.title = element_text(size = 20, hjust = 0.5),
+        axis.title = element_text(size = 16),
+        axis.text = element_text(size = 13),
+        panel.grid.major.x = element_blank(),
+        panel.grid.minor.y = element_blank(),
+        legend.title = element_text(size = 15),
+        legend.text = element_text(size = 12))
+
+## Scree-plot
+as_tibble(pca_m$variance,
+                 rownames = "pca") %>% 
+  dplyr::filter(value >= 1) %>% 
+  dplyr::mutate(sum = cumsum(value),
+                group = 1,
+                pca = factor(pca, 
+                             levels = pca)) %>% 
+  ggplot(aes(x = pca, y = value)) +
+  geom_bar(stat = "identity",
+           position = "dodge",
+           fill = "#00b4d8",
+           alpha = 0.6,
+           color = "black") +
+  geom_point(aes(x = pca, y = sum),
+             size = 4) +
+  geom_line(aes(x = pca, y = sum, group = group),
+            color = "#023e8a",
+            linewidth = 2) +
+  geom_hline(yintercept = 80,
+             linetype = "dashed",
+             linewidth = 1.2) +
+  ylim(c(0, 105)) +
+  labs(title = "Scree plot",
+       x = "",
+       y = "Proportion of explained variance (%)") +
+  theme_bw() +
+  theme(plot.title = element_text(size = 20, hjust = 0.5),
+        axis.title = element_text(size = 16),
+        axis.text = element_text(size = 13, angle = 45, hjust = 1),
+        panel.grid.major.x = element_blank(),
+        panel.grid.minor.y = element_blank())
+
+# Clean the environment
+rm(list = c("m", "pca_m"))
+```
+
+### Heatmap
+
+```{r}
+#| label: gg-heatmap-nobatch
+#| echo: false
+#| warnings: false
+#| fig.width: 7
+#| fig.height: 6
+#| fig.align: center
+
+# Heatmap
+lrpkm_var <- apply(lrpkm_withoutBatch, 1, var)
+topgenes <- names(lrpkm_var[order(lrpkm_var, decreasing = T)][1:200])
+
+## Scale by row
+topmat_scaled <- t(scale(t(lrpkm_withoutBatch[topgenes,])))
+
+Heatmap(topmat_scaled,
+        cluster_rows = TRUE,
+        cluster_columns = TRUE,
+        # Split columns
+        column_split = annotations$u1,
+        cluster_column_slices = FALSE,
+        column_title_gp = gpar(fontsize = 12),
+        # Text
+        show_row_names = FALSE,
+        show_column_names = TRUE,
+        column_names_gp = gpar(fontsize = 10),
+        column_names_rot = 45,
+        # Legend
+        heatmap_legend_param = list(title = "Expression\n(Log-RPKM)",
+                                    title_gp = gpar(fontsize = 11),
+                                    labels_gp = gpar(fontsize = 10)),
+        # Annotations
+        top_annotation = HeatmapAnnotation(df = annotations,
+                                           col = annotation_colors,
+                                           annotation_legend_param = list(title_gp = gpar(fontsize = 11),
+                                                                          labels_gp = gpar(fontsize = 10)),
+                                           annotation_name_gp = gpar(fontsize = 11)),
+        # External border
+        border = TRUE,
+        border_gp = gpar(lwd = 0.5),
+        # Cell border
+        rect_gp = gpar(col = NA),
+        # Cell size
+        width = ncol(topmat_scaled)*unit(8, "mm"), 
+        # Expression color
+        col = circlize::colorRamp2(range(topmat_scaled), c("#E4E1E3FF", "#0072B2")))
+
+# Clean the environment
+rm(list = c("topmat_scaled", "topgenes", "lrpkm_var"))
+```
+
+### Heatmap of sample-to-sample distances
+
+```{r}
+#| label: gg-heatmap-sample2sample-nobatch
+#| echo: false
+#| warnings: false
+#| fig.width: 7
+#| fig.height: 6
+#| fig.align: center
+
+# Heatmap of sample-to-sample distances
+## Calculate the distance matrix
+MDS_res <- plotMDS(lrpkm_withoutBatch,
+                   top = 1000,
+                   labels = dge_matrix$samples$group,
+                   gene.selection = "pairwise",
+                   plot = FALSE)
+
+## Plot
+Heatmap(MDS_res$distance.matrix,
+        cluster_rows = TRUE,
+        cluster_columns = TRUE,
+        # Text
+        column_title = "Heatmap of sample-to-sample distances",
+        column_title_gp = gpar(fontsize = 14),
+        show_row_names = FALSE,
+        show_column_names = FALSE,
+        # Legend
+        heatmap_legend_param = list(title = "Sample-to-sample\ndistance",
+                                    title_gp = gpar(fontsize = 11),
+                                    labels_gp = gpar(fontsize = 10)),
+        # Annotations
+        top_annotation = HeatmapAnnotation(df = annotations,
+                                           col = annotation_colors,
+                                           annotation_name_gp = gpar(fontsize = 11),
+                                           annotation_legend_param = list(title_gp = gpar(fontsize = 11),
+                                                                          labels_gp = gpar(fontsize = 10))),
+        left_annotation = rowAnnotation(df = annotations,
+                                        col = annotation_colors,
+                                        show_legend = FALSE,
+                                        show_annotation_name = FALSE),
+        # External border
+        border = TRUE,
+        border_gp = gpar(lwd = 0.5),
+        # Cell border
+        rect_gp = gpar(col = NA),
+        # Size
+        width = ncol(MDS_res$distance.matrix) * unit(8, "mm"),
+        height = nrow(MDS_res$distance.matrix) * unit(8, "mm"),
+        # Colors
+        col = circlize::colorRamp2(range(MDS_res$distance.matrix),rev(brewer.pal(9, "Blues"))[c(1,9)]))
+
+# Clean the environment
+rm(list = c("MDS_res", "lrpkm_withoutBatch", "lrpkm"))
+```
+:::
+
+## Differential expression analysis
+
+Considering the detected batch effect, the contrast matrix that will be used for the differential gene expression analysis is:
+
+```{r}
+#| label: define-design-2
+#| include: false
+
+# Guide to understand matrices: https://bioconductor.org/packages/release/workflows/vignettes/RNAseq123/inst/doc/designmatrices.html
+design <- model.matrix(~0 + metadata$group + metadata$cell_line)
+colnames(design) <- c(levels(metadata$group), levels(metadata$cell_line)[c(2:3)])
+
+# Make the contrast matrix
+contr.matrix <- makeContrasts(
+  MUTvsWT = U1_mut - U1_wt,
+  levels = design)
+
+# Save the design to use it for the pathway enrichment analysis
+qs_save(list(design = design,
+             contr.matrix = contr.matrix),
+        file = glue::glue("{out.dir}/design_matrix.qs2"))
+```
+
+```{r}
+#| label: table-contr-matrix
+#| echo: false
+
+kableExtra::kable(contr.matrix,
+      align = "c") %>% 
+  kableExtra::kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"),
+                position = "center",
+                font_size = 12)
+```
+
+```{r}
+#| label: explanation-edgeR-limma
+#| include: false
+
+# From: https://support.bioconductor.org/p/9163016/#9163033
+# More info: https://support.bioconductor.org/p/9155447/
+
+# The short answer is that we generally prefer edgeR for applications with lots of small counts and limma for complex designs with random effects and outlier samples.
+
+# We generally prefer edgeR for Hi-C, ChIP-seq, ATAC-seq, CUT&Tag, methylation, transcript-specific analyses, and haplotype-specific analyses. We generally use limma for a wide range of other RNA-seq experiments
+
+# In case of having repeated measures is better to use limma (https://www.biostars.org/p/9584517/ and https://bioconductor.org/packages/release/bioc/vignettes/variancePartition/inst/doc/dream.html)
+```
+
+### EdgeR v4
+
+#### Estimating negative binomial dispersion
+
+```{r}
+#| label: explanation-5
+#| include: false
+
+# From doi:10.1093/nar/gkaf018
+
+# edgeR pioneered the use of the negative binomial distribution to model read count data with replicates and the use of generalized linear models to analyze complex experimental designs. edgeR implements empirical Bayes moderation methods to allow reliable inference when the number of replicates is small.
+
+# Newer in v4: The first is a continuous generalization of the negative binomial distribution that allows edgeR to accept fractional counts without rounding. The second is a major revision of the quasi-likelihood pipeline based on improvements to the classical statistical theory underlying generalized linear models. The revision ensures unbiased quasi-dispersion estimates even when the read counts are very small and reduces computation time for large datasets with many samples.
+
+# In edgeR v4, one can proceed directly from normalization to glmQLFit to fit GLMs and glmQLFTest to test hypotheses. In edgeR v4, the glmQLFit function estimates both NB and quasi-dispersions automatically. The functions glmFit and glmQLFit shrink the estimated log-fold-changes slightly towards zero to avoid infinite values and to improve prediction accuracy. edgeR implements the concept of a ‘prior count’ to quantify the prior information determining the amount of shrinkage.
+
+# From https://bioconductor.org/packages/release/workflows/vignettes/RnaSeqGeneEdgeRQL/inst/doc/edgeRQL.html#dispersion-estimation
+
+# Setting robust=TRUE is used to protect the empirical Bayes estimates against the possibility of outlier genes with exceptionally large or small individual dispersions (Phipson et al. 2016)
+```
+
+```{r}
+#| label: edgeR-nb-dispersion
+#| include: false
+
+# Dispersion estimation for QC only
+dge_matrix_disp <- estimateDisp(dge_matrix,
+                                design,
+                                robust=TRUE)
+```
+
+First, we checked the dispersion of the genes. For RNA-seq studies, the negative binomial (NB) dispersions tend to be higher for genes with very low counts. The dispersion trend tends to decrease smoothly with abundance and to asymptotic to a constant value for genes with larger counts. Normally, the common value for the BCV (biological coefficient of variation) tends to be in range from 0.05 to 0.2 for genetically identical mice or cell lines, whereas somewhat larger values (\>0.3 ) are observed for human subjects. In our case, the common dispersion is `r round(dge_matrix_disp$common.dispersion, 4)`
+
+```{r}
+#| label: gg-edgeR-nb-dispersion
+#| echo: false
+#| fig.width: 9
+#| fig.height: 6
+#| fig.align: center
+
+# Plot based on the plotBCV() function
+tibble(tagwise = sqrt(dge_matrix_disp$tagwise.dispersion),
+       common = sqrt(dge_matrix_disp$common.dispersion),
+       trend = sqrt(dge_matrix_disp$trended.dispersion),
+       cpm = dge_matrix_disp$AveLogCPM) %>% 
+  ggplot(aes(x = cpm)) +
+  geom_point(aes(y = tagwise, color = "Tagwise"),
+             alpha = 0.8,
+             size = 0.1) +
+  geom_line(aes(y = common, color = "Common"),
+            linewidth = 0.8) +
+  geom_line(aes(y = trend, color = "Trend"),
+            linewidth = 0.8) +
+  scale_color_manual(values = c("Tagwise" = "black",
+                                "Common" = "#e76f51",
+                                "Trend" = "#1976d2"),
+                     breaks = c("Tagwise", "Common", "Trend"),
+                     guide = guide_legend(override.aes = list(size = 1.5, linewidth = 1))) +
+  labs(title = "Biological coefficient of variation plot",
+       x = "Average log2-CPM",
+       y = "Biological coefficient of variation",
+       color = "") +
+  theme_bw() +
+  theme(plot.title = element_text(size = 16, hjust = 0.5),
+        axis.title = element_text(size = 14),
+        axis.text = element_text(size = 13),
+        legend.text = element_text(size = 12),
+        legend.position = "top")
+
+rm(dge_matrix_disp)
+```
+
+#### Extending to quasi-likelihood dispersion
+
+```{r}
+#| label: explanation-6
+#| include: false
+
+# From: https://bioconductor.org/packages/release/workflows/vignettes/RnaSeqGeneEdgeRQL/inst/doc/edgeRQL.html#dispersion-estimation
+
+# The NB model can be extended with quasi-likelihood (QL) methods to account for gene-specific variability from both biological and technical sources (Lund et al. 2012; Lun, Chen, and Smyth 2016). Under the QL framework, the NB dispersion trend is used to describe the overall biological variability across all genes, and gene-specific variability above and below the overall level is picked up by the QL dispersion.
+
+# Setting robust=TRUE in glmQLFit is usually recommended (Phipson et al. 2016). This allows gene-specific prior df (degrees of freedom) estimates, with lower values for outlier genes and higher values for the main body of genes. This reduces the chance of getting false positives from genes with extremely high or low raw dispersions, while at the same time increasing statistical power to detect differential expression for the main body of genes.
+```
+
+```{r}
+#| label: edgeR-ql-fitting
+#| include: false
+
+# glmQLFit estimates the dispersion automatically
+edgeR_fit <- glmQLFit(dge_matrix,
+                      design = design,
+                      robust = TRUE)
+```
+
+The NB dispersion is then extended with quasi-likelihood (QL) methods to account for gene-specific variability from both biological and technical sources. The QL function squeezes the raw QL dispersion estimates towards a global trend, and this moderation reduces the uncertainty of the estimates and improves testing power.
+
+```{r}
+#| label: gg-edgeR-ql-dispersion
+#| echo: false
+#| fig.width: 9
+#| fig.height: 6
+#| fig.align: center
+
+# Plot based on the plotQLDisp() function
+tibble(df.residual = ifelse(is.null(edgeR_fit$df.residual.zeros),
+                            edgeR_fit$df.residual.adj,
+                            edgeR_fit$df.residual.zeros),
+       deviance = edgeR_fit$deviance,
+       s2.post = edgeR_fit$s2.post,
+       trend = edgeR_fit$s2.prior,
+       cpm = edgeR_fit$AveLogCPM) %>% 
+  dplyr::mutate(s2 = ifelse(df.residual < 1e-08,
+                            0,
+                            deviance/df.residual),
+                s2 = sqrt(sqrt(s2)),
+                s2.post = sqrt(sqrt(s2.post)),
+                trend = sqrt(sqrt(trend))) %>% 
+  dplyr::select(-df.residual, -deviance) %>% 
+  dplyr::arrange(cpm) %>% 
+  ggplot(aes(x = cpm)) +
+  geom_point(aes(y = s2, color = "Raw"),
+             alpha = 0.8,
+             size = 0.1) +
+  geom_point(aes(y = s2.post, color = "Squeezed"),
+             alpha = 0.8,
+             size = 0.1) +
+  geom_line(mapping = aes(y = trend, color = "Trend"),
+            linewidth = 0.8) +
+  scale_color_manual(values = c("Raw" = "black",
+                                "Squeezed" = "#e76f51",
+                                "Trend" = "#1976d2"),
+                     breaks = c("Raw", "Squeezed", "Trend"),
+                     guide = guide_legend(override.aes = list(size = 1.5, linewidth = 1))) +
+  labs(title = "Quasi-Likelihood dispersion plot",
+       x = "Average log2-CPM",
+       y = "Quarter-root mean deviance",
+       color = "") +
+  theme_bw() +
+  theme(plot.title = element_text(size = 16, hjust = 0.5),
+        axis.title = element_text(size = 14),
+        axis.text = element_text(size = 13),
+        legend.text = element_text(size = 12),
+        legend.position = "top")
+```
+
+#### Testing for differential expression
+
+```{r}
+#| label: explanation-7
+#| include: false
+
+# doi:10.1093/nar/gkaf018
+
+# The glmLRT or glmQLFTest functions can be replaced by glmTreat if one wants to test differential abundance relative to a higher fold-change threshold 
+
+# The standard edgeR analysis identifies differential expression based on statistical significance regardless of how small the difference might be. There are circumstances where researchers are interested in studying genomic features of which the expression levels change by a certain amount. A few ad hoc approaches have been used to select features with large fold-changes. For example, some studies applied a foldchange cut-off and then ranked all the genes above that foldchange threshold by P-value. There were also some cases where genes were first chosen according to a P-value cut-off and then sorted by their fold-changes. However, these ad hoc approaches tend to prioritise low expression genes and can lead to loss of FDR control. 
+
+# To assess differential expression relative to a threshold in a statistically rigorous way, the TREAT method was developed under the limma EB framework. It adopts a re-centred moderated t-statistic to provide an upper bound of the type I error rate. This approach yields an easily computable conservative P-value for testing against a fold-change threshold. We adopted the idea of TREAT and extended it to the edgeR NB GLM framework. Unlike TREAT, the edgeR approach computes the expectation rather than the maximum value of the type I error rate as the P-value of the test, a refinement that increases the statistical power of the test while still controlling the FDR. This method is implemented in the glmTreat function in edgeR, and it can be used under both the LRT and the QL F-test pipelines.
+
+# From glmTreat documentation
+# Note that, unlike other edgeR functions such as glmLRT and glmQLFTest, glmTreat can only accept a single contrast. If contrast is a matrix with multiple columns, then only the first column will be used.
+```
+
+```{r}
+#| label: edgeR-testing-differences
+#| include: false
+
+lfcCutoff <- log2(1.3)
+pCutoff <- 0.05
+
+# Treat implementation
+edgeR_fit_test <- glmTreat(edgeR_fit,
+                           contrast = contr.matrix,
+                           lfc = lfcCutoff)
+
+# Normal QL implementation
+# edgeR_model_fit_test <- glmQLFTest(edgeR_model_fit,
+#                                    contrast = contr.matrix)
+```
+
+The number of deregulated genes using the `glmQLFit-glmTreat` approach is:
+
+```{r}
+#| label: table-summary-dge-edgeR
+#| echo: false
+
+is.de <- decideTests(edgeR_fit_test,
+                     adjust.method = "BH",
+                     p.value = pCutoff)
+colnames(is.de) <- colnames(contr.matrix)
+
+is.de.sum <- summary(is.de)
+kableExtra::kable(is.de.sum, 
+                  align = "c") %>% 
+  kableExtra::kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"),
+                            position = "center",
+                            font_size = 12)
+
+# Clean the environment
+rm(is.de.sum)
+```
+
+The magnitude of the differential expression changes can be visualized with a fitted model Mean-Difference (MD) plot.
+
+```{r}
+#| label: explanation-8
+#| include: false
+
+# The MD plot shows the relationship between the mean expression level (average expression across conditions, on the x-axis) and the difference in expression (log-fold change, on the y-axis). The main purpose of an MD plot is to quickly identify genes that are significantly up- or down-regulated while highlighting potential biases related to expression level.
+```
+
+```{r}
+#| label: gg-edgeR-mdplot
+#| echo: false
+#| fig.width: 9
+#| fig.height: 6
+#| fig.align: center
+
+edgeR_fit_test$table %>% 
+  dplyr::mutate(sig = as.data.frame(is.de)[,1],
+                sig = factor(sig,
+                             levels = c(-1,0,1),
+                             labels = c("Down", "Not sig", "Up"))) %>% 
+  ggplot(aes(x = logCPM, y = logFC, color = sig, size = sig)) +
+  geom_point(alpha = 0.8) +
+  scale_size_manual(values = c("Not sig" = 0.2,
+                               "Up" = 0.7,
+                               "Down" = 0.7),
+                    guide = "none") +
+  scale_color_manual(values = c("Not sig" = "black",
+                                "Up" = "#e76f51",
+                                "Down" = "#1976d2")) +
+  labs(title = "Mean-Difference plot",
+       x = "Average log2-CPM",
+       y = "log2-fold-change",
+       color = "Direction") +
+  theme_bw() +
+  theme(plot.title = element_text(size = 16, hjust = 0.5),
+        axis.title = element_text(size = 14),
+        axis.text = element_text(size = 13),
+        legend.text = element_text(size = 12),
+        legend.position = "top")
+```
+
+```{r}
+#| label: dge-result-edgeR
+#| include: false
+
+# Calculate TPMs
+mean_tpms <- tpms %>% 
+  tidyr::pivot_longer(cols = -entrezid,
+                      names_to = "sample",
+                      values_to = "tpm") %>% 
+  dplyr::group_by(entrezid) %>% 
+  dplyr::summarise(tpm = mean(tpm),
+                   .groups = "drop")
+
+# Export the results
+dge_results <- as_tibble(edgeR_fit_test$table,
+                         rownames = "entrezid") %>% 
+  dplyr::left_join(edgeR_fit_test$genes %>% 
+                     dplyr::mutate(entrezid = as.character(entrezid)),
+                   by = "entrezid") %>% 
+  dplyr::left_join(as_tibble(as.data.frame(is.de), rownames = "entrezid") %>% 
+                     dplyr::rename(down_up = colnames(.)[2]),
+                   by = "entrezid") %>% 
+  dplyr::left_join(mean_tpms,
+                   by = "entrezid") %>% 
+  dplyr::mutate(pvalue_BH = p.adjust(PValue, method = "BH"),
+                pvalue_bonferroni = p.adjust(PValue, method = "bonferroni")) %>% 
+  dplyr::rename(ensembl_id = geneid,
+                entrez_id = entrezid,
+                log2fc = logFC,
+                log2cpm = logCPM,
+                pvalue = PValue) %>% 
+  dplyr::arrange(pvalue, pvalue_BH, log2fc) %>% 
+  dplyr::select(ensembl_id, log2cpm, tpm, log2fc, pvalue, pvalue_BH, pvalue_bonferroni, down_up, symbol, entrez_id, length)
+
+dge_results_sig <- dge_results %>% 
+  dplyr::filter(down_up != 0)
+
+# Save the results in an excel file
+openxlsx::write.xlsx(dge_results,
+                     file = glue::glue("{out.dir}/{prefix}_all_contrasts_differential_expression_results_edgeR4.xlsx"))
+
+# Save the results in qs file to be imported with R
+qs_save(dge_results,
+        file = glue::glue("{out.dir}/{prefix}_all_contrasts_differential_expression_results_edgeR4.qs2"))
+qs_save(dge_results_sig,
+        file = glue::glue("{out.dir}/{prefix}_all_contrasts_significant_genes_results_edgeR4.qs2"))
+
+# Clean the environment
+rm(list=c("tpms", "is.de", "edgeR_fit", "edgeR_fit_test"))
+```
+
+```{r}
+#| label: table-dge-result-edgeR
+#| echo: false
+#| results: asis
+
+dge_results_sig %>% 
+  dplyr::mutate(log2cpm = round(log2cpm, 4),
+                tpm = round(tpm, 4),
+                log2fc = round(log2fc, 4),
+                pvalue = scientific(pvalue, digits = 3),
+                pvalue_BH = scientific(pvalue_BH, digits = 3),
+                pvalue_bonferroni = scientific(pvalue_bonferroni, digits = 3)) %>%
+  DT::datatable(rownames = FALSE,
+                options = list(
+                  pageLength = 10,
+                  lengthMenu = c(10, 20, 50, 100),
+                  scrollX = TRUE,
+                  initComplete = JS(
+                    "function(settings, json) {",
+                    "$(this.api().table().header()).css({'font-size': '14px'});",
+                    "}"))) %>% 
+  DT::formatStyle(columns = c(0:(ncol(dge_results_sig)-1)),
+                  fontSize = '14px')
+```
+
+### Limma
+
+#### Fitting the liner models
+
+```{r}
+#| label: explanation-9
+#| include: false
+
+# It has been shown that for RNA-seq count data, the variance is not independent of the mean (Law et al. 2014) – this is true for raw counts or when transformed to log-CPM values. Methods that model counts using a Negative Binomial distribution assume a quadratic mean-variance relationship. In limma, linear modeling is carried out on the log-CPM values which are assumed to be normally distributed and the mean-variance relationship is accommodated using precision weights calculated by the voom function.
+
+# The voom function is intended to process RNA-seq or ChIP-seq data prior to linear modeling in limma. Voom is an acronym for mean-variance modeling at the observational level. The idea is to estimate the mean-variance relationship in the data, then use this to compute an appropriate precision weight for each observation. Count data always show marked mean-variance relationships. Raw counts show increasing variance with increasing count size, while log-counts typically show a decreasing mean-variance trend. This function estimates the mean-variance trend for log-counts, then assigns a weight to each observation based on its predicted variance. The weights are then used in the linear modeling process to adjust for heteroscedasticity.
+
+# Voom performs the following speciﬁc calculations. First, the counts are converted to logCPM values, adding 0.5 to all the counts to avoid taking the logarithm of zero. The matrix of logCPM values is then optionally normalized. The lmFit function is used to ﬁt row-wise linear models. The lowess function is then used to ﬁt a trend to the square-root-standard-deviations as a function of an average log-count measure. The trend line is then used to predict the variance of each logCPM value as a function of its ﬁtted value on the count scale, and the inverse variances become the estimated precision weights.
+
+# If block is specified, then the intra-block correlation is estimated using duplicateCorrelation. In that case, the voom weights and the intra-block correlation are each estimated twice to achieve effective convergence.
+```
+
+```{r}
+#| label: limma-fit
+#| include: false
+
+limma_fit <- voomLmFit(dge_matrix,
+          design = design,
+          block = glue::glue("{metadata$cell_line}_{metadata$group}"),
+          plot=TRUE,
+          save.plot=TRUE)
+
+limma_fit <- contrasts.fit(limma_fit,
+                           contrasts = contr.matrix)
+```
+
+The limma-voom approach assumes that log2-counts show a decreasing mean-variance trend with increasing count size:
+
+```{r}
+#| label: gg-limma-dispersion
+#| echo: false
+#| fig.width: 9
+#| fig.height: 6
+#| fig.align: center
+
+tibble(x = limma_fit$voom.xy$x,
+       y = limma_fit$voom.xy$y) %>% 
+  ggplot(aes(x = x, y = y)) +
+  geom_point(alpha = 0.8,
+             size = 0.1) +
+  geom_line(data = tibble(x = limma_fit$voom.line$x,
+                          y = limma_fit$voom.line$y),
+            aes(color = "Trend")) +
+  scale_color_manual(values = c("Trend" = "#1976d2")) +
+  labs(x = "Average log2-counts",
+       y = "Square-root mean deviance",
+       color = "") +
+  theme_bw() +
+  theme(plot.title = element_text(size = 16, hjust = 0.5),
+        axis.title = element_text(size = 14),
+        axis.text = element_text(size = 13),
+        legend.text = element_text(size = 12),
+        legend.position = "top")
+```
+
+#### Testing for differential expression
+
+```{r}
+#| label: explanation-10
+#| include: false
+
+# Empirical Bayes moderation is carried out by borrowing information across all the genes to obtain more precise estimates of gene-wise variability (Smyth 2004). To do this, there are two options: eBayes or treat. These functions are used to rank genes in order of evidence for differential expression. They use an empirical Bayes method to squeeze the genewise-wise residual variances towards a common value (or towards a global trend) (Smyth, 2004; Phipson et al, 2016). The degrees of freedom for the individual variances are increased to reflect the extra information gained from the empirical Bayes moderation, resulting in increased statistical power to detect differential expression.
+
+# Treat computes empirical Bayes moderated-t p-values relative to a minimum meaningful foldchange threshold. Instead of testing for genes that have true log-fold-changes different from zero, it tests whether the true log2-fold-change is greater than lfc in absolute value (McCarthy and Smyth, 2009). In other words, it uses an interval null hypothesis, where the interval is [-lfc,lfc]. When the number of DE genes is large, treat is often useful for giving preference to larger fold-changes and for prioritizing genes that are biologically important. treat is concerned with p-values rather than posterior odds, so it does not compute the B-statistic lods. The idea of thresholding doesn't apply to F-statistics in a straightforward way, so moderated F-statistics are also not computed. When lfc=0, treat is identical to eBayes, except that F-statistics and B-statistics are not computed. The lfc threshold is usually chosen relatively small, because signiﬁcantly DE genes must all have fold changes substantially greater than the testing threshold. Typical values for lfc are log2(1.1), log2(1.2) or log2(1.5).
+
+# Note that the lfc testing threshold used by treat to the define the null hypothesis is not the same as a log2-fold-change cutoff, as the observed log2-fold-change needs to substantially larger than lfc for the gene to be called as significant. In practice, modest values for lfc such as log2(1.1), log2(1.2) or log2(1.5) are usually the most useful. In practice, setting lfc=log2(1.2) or lfc=log2(1.5) will usually cause most differentially expressed genes to have estimated foldchanges of 2-fold or greater, depending on the sample size and precision of the experiment.
+
+# The choice between using eBayes and treat in the limma package depends on the specific analysis requirements. The eBayes method is commonly used for empirical Bayes moderation of the t-statistics, which is suitable for identifying differentially expressed genes (DEGs) in RNA-seq data. On the other hand, the treat function in limma is used to compute moderated t-statistics and P-values without the assumption of a common dispersion, making it useful for detecting small but consistent changes in gene expression. When using eBayes, the trend argument can be set to TRUE to apply the trend-based empirical Bayes moderation, which is recommended for RNA-seq analysis when the library sizes are reasonably consistent. On the other hand, the treat function is useful when the goal is to identify genes with a consistent fold change, especially in the presence of heterogeneous variances.
+```
+
+```{r}
+#| label: limma-testing-differences
+#| include: false
+
+lfcCutoff <- log2(1.3)
+pCutoff <- 0.05
+
+limma_fit_test <- treat(limma_fit,
+                        lfc = lfcCutoff,
+                        trend = TRUE,
+                        robust = TRUE)
+```
+
+The number of deregulated genes using the `voomLmFit-treat` approach is:
+
+```{r}
+#| label: table-summary-dge-limma
+#| echo: false
+
+is.de <- decideTests(limma_fit_test,
+                     adjust.method = "BH",
+                     p.value = pCutoff)
+colnames(is.de) <- colnames(contr.matrix)
+
+is.de.sum <- summary(is.de)
+kableExtra::kable(is.de.sum, 
+                  align = "c") %>% 
+  kableExtra::kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"),
+                            position = "center",
+                            font_size = 12)
+
+# Clean the environment
+rm(is.de.sum)
+```
+
+The magnitude of the differential expression changes can be visualized with a fitted model Mean-Difference (MD) plot.
+
+```{r}
+#| label: explanation-11
+#| include: false
+
+# The MD plot shows the relationship between the mean expression level (average expression across conditions, on the x-axis) and the difference in expression (log-fold change, on the y-axis). The main purpose of an MD plot is to quickly identify genes that are significantly up- or down-regulated while highlighting potential biases related to expression level.
+```
+
+```{r}
+#| label: gg-limma-mdplot
+#| echo: false
+#| fig.width: 9
+#| fig.height: 6
+#| fig.align: center
+
+tibble(logCPM = limma_fit_test$Amean,
+       log2fc = as.data.frame(limma_fit_test$coefficients)[,1]) %>% 
+  dplyr::mutate(sig = as.data.frame(is.de)[,1],
+                sig = factor(sig,
+                             levels = c(-1,0,1),
+                             labels = c("Down", "Not sig", "Up"))) %>% 
+  ggplot(aes(x = logCPM, y = log2fc, color = sig, size = sig)) +
+  geom_point(alpha = 0.8) +
+  scale_size_manual(values = c("Not sig" = 0.2,
+                               "Up" = 0.7,
+                               "Down" = 0.7),
+                    guide = "none") +
+  scale_color_manual(values = c("Not sig" = "black",
+                                "Up" = "#e76f51",
+                                "Down" = "#1976d2")) +
+  labs(title = "Mean-Difference plot",
+       x = "Average log2-CPM",
+       y = "log2-fold-change",
+       color = "Direction") +
+  theme_bw() +
+  theme(plot.title = element_text(size = 16, hjust = 0.5),
+        axis.title = element_text(size = 14),
+        axis.text = element_text(size = 13),
+        legend.text = element_text(size = 12),
+        legend.position = "top")
+```
+
+```{r}
+#| label: dge-result-limma
+#| include: false
+
+# Calculate TPMs
+mean_tpms <- tpms %>% 
+  tidyr::pivot_longer(cols = -entrezid,
+                      names_to = "sample",
+                      values_to = "tpm") %>% 
+  dplyr::group_by(entrezid) %>% 
+  dplyr::summarise(tpm = mean(tpm),
+                   .groups = "drop")
+
+# Export the results
+dge_results <- bind_cols(limma_fit_test$genes,
+                         log2cpm = limma_fit_test$Amean,
+                         log2fc = as.data.frame(limma_fit_test$coefficients)[,1],
+                         t = as.data.frame(limma_fit_test$t)[,1],
+                         pvalue = as.data.frame(limma_fit_test$p.value)[,1]) %>% 
+  as_tibble() %>% 
+  dplyr::mutate(entrezid = as.character(entrezid)) %>% 
+  dplyr::left_join(as_tibble(as.data.frame(is.de), rownames = "entrezid") %>% 
+                     dplyr::rename(down_up = colnames(.)[2]),
+                   by = "entrezid") %>% 
+  dplyr::left_join(mean_tpms,
+                   by = "entrezid") %>% 
+  dplyr::mutate(pvalue_BH = p.adjust(pvalue, method = "BH"),
+                pvalue_bonferroni = p.adjust(pvalue, method = "bonferroni")) %>% 
+  dplyr::rename(ensembl_id = geneid,
+                entrez_id = entrezid) %>% 
+  dplyr::arrange(pvalue, pvalue_BH, log2fc) %>% 
+  dplyr::select(ensembl_id, log2cpm, tpm, log2fc, pvalue, pvalue_BH, pvalue_bonferroni, down_up, symbol, entrez_id, length)
+
+dge_results_sig <- dge_results %>% 
+  dplyr::filter(down_up != 0)
+
+# Save the results in an excel file
+openxlsx::write.xlsx(dge_results,
+                     file = glue::glue("{out.dir}/{prefix}_all_contrasts_differential_expression_results_limma.xlsx"))
+
+# Save the results in qs file to be imported with R
+qs_save(dge_results,
+        file = glue::glue("{out.dir}/{prefix}_all_contrasts_differential_expression_results_limma.qs2"))
+qs_save(dge_results_sig,
+        file = glue::glue("{out.dir}/{prefix}_all_contrasts_significant_genes_results_limma.qs2"))
+
+# Clean the environment
+rm(list=c("tpms", "is.de", "limma_fit", "limma_fit_test"))
+```
+
+```{r}
+#| label: table-dge-result-limma
+#| echo: false
+#| results: asis
+
+dge_results_sig %>% 
+  dplyr::mutate(log2cpm = round(log2cpm, 4),
+                tpm = round(tpm, 4),
+                log2fc = round(log2fc, 4),
+                pvalue = scientific(pvalue, digits = 3),
+                pvalue_BH = scientific(pvalue_BH, digits = 3),
+                pvalue_bonferroni = scientific(pvalue_bonferroni, digits = 3)) %>%
+  DT::datatable(rownames = FALSE,
+                options = list(
+                  pageLength = 10,
+                  lengthMenu = c(10, 20, 50, 100),
+                  scrollX = TRUE,
+                  initComplete = JS(
+                    "function(settings, json) {",
+                    "$(this.api().table().header()).css({'font-size': '14px'});",
+                    "}"))) %>% 
+  DT::formatStyle(columns = c(0:(ncol(dge_results_sig)-1)),
+                  fontSize = '14px')
+```
+
+## Data visualization
+
+```{r}
+#| label: explanation-12
+#| include: false
+
+# From Michael Love (DESeq2): https://support.bioconductor.org/p/9145456/
+
+# About qqplot: We discuss in the original paper, there are many studies where the majority of genes are affected in some amount by treatment. QQ-plot as I use it is helpful when the signal is sparse and the data consist with the null is dominant, as you expect the points to mostly fall on the theoretical line under the null. So if you have a dataset which is of the former type, I'm not sure what you learn from the QQ-plot. 
+```
+
+### P-Value histogram
+
+```{r}
+#| label: explanation-13
+#| include: false
+
+# The U-shaped p-value histogram because TREAT tests a composite null (\|log-FC\| ≤ δ) rather than the simple null (log-FC = 0) used by ordinary moderated t / eBayes. P-values from tests of a composite null are generally not uniform under the null: many null genes give conservative (large) p-values (pile up near 1) while truly big effects still give very small p-values (pile up near 0). The mix of those two piles makes a U-shape. Thus, we can also consider that simple null (log-FC = 0) is a two-side test, while (\|log-FC\| ≤ δ) is a one-side test, and according to <http://varianceexplained.org/statistics/interpreting-pvalue-histogram/>, this can explain the U-shape.
+
+# TREAT returns slightly conservative p-values, an inevitable side-effect of testing a composite null hypothesis. This means that the true FDR is likely to be better than the nominal rate suggested by the p-values. An unavoidable consequence is that the TREAT p-values do not follow perfectly the traditional uniform distribution for genes which are genuinely not differentially expressed. Rather, the null distribution of the TREAT p-values is somewhat skewed towards larger values. While TREAT p-values can be used with most multiple testing adjustment schemes, including Benjamini and Hochberg, they do not fulfil the assumptions of some methods which try to estimate the proportion of truly null genes such as Ferkingstad et al. (from PMID: 19176553)
+```
+
+The P-Value histogram displays a bimodal distribution, with one peak corresponding to genes with significant p-values and another peak near 1 corresponding to genes below the fold change threshold in the `glmTreat()` function.
+
+```{r}
+#| label: gg-pvalue-hist
+#| echo: false
+#| fig.width: 11
+#| fig.height: 6
+#| fig.align: center
+
+dge_results %>% 
+  ggplot(aes(x = pvalue)) + 
+  geom_histogram(bins = 100) +
+  labs(title = glue::glue("P-Value Histogram"),
+       x = "P-Value",
+       y = "Count") +
+  theme_bw() +
+  theme(plot.title = element_text(size = 16, hjust = 0.5),
+        axis.title = element_text(size = 14),
+        axis.text = element_text(size = 13),
+        legend.text = element_text(size = 12),
+        legend.position = "top")
+```
+
+### Volcano plot
+
+The volcano plot displays the statistical significance (`−log10(p-value)`, y-axis) versus the magnitude and direction of gene expression changes (`log2 fold-change`, x-axis). Its primary purpose is to quickly identify significantly up- or down-regulated genes, highlighting those with strong biological effects and high statistical confidence.
+
+*Green points indicate genes whose p-values do not pass the significance threshold (`r pCutoff`) but have large fold-changes (`r lfcCutoff`). Blue points represent genes with statistically significant p-values but insufficient fold-changes. Red points highlight genes meeting both thresholds, indicating significant differential expression.*
+
+```{r}
+#| label: gg-volcano
+#| echo: false
+#| fig.width: 10
+#| fig.height: 7
+#| fig.align: center
+
+dge_results %>% 
+  dplyr::select(entrez_id, log2fc, pvalue, symbol) %>% 
+  dplyr::mutate(group = case_when(abs(log2fc) >= lfcCutoff & pvalue <= pCutoff ~ "both",
+                                  abs(log2fc) >= lfcCutoff & pvalue > pCutoff ~ "fc",
+                                  abs(log2fc) < lfcCutoff & pvalue <= pCutoff ~ "pvalue",
+                                  .default = "none"),
+                group = factor(group)) %>% 
+  ggplot(aes(x = log2fc, y = -log10(pvalue), color = group)) +
+  geom_point(size = 1) +
+  scale_color_manual(values = c("both" = "red",
+                                "fc" = "#30A56C",
+                                "pvalue" = "#2380CD",
+                                "none" = "black")) +
+  geom_vline(xintercept = c(-lfcCutoff, lfcCutoff),
+             linetype = "longdash",
+             linewidth = 0.7) + 
+  geom_hline(yintercept = -log10(pCutoff),
+             linetype = "longdash",
+             linewidth = 0.7) +
+  geom_text_repel(data = . %>% head(15),
+                  mapping = aes(x = log2fc,
+                                y = -log10(pvalue),
+                                label = symbol),
+                  hjust = 1.2,
+                  color = "black",
+                  size = 4) +
+  labs(title = glue::glue("Volcano plot"),
+       x = "log2-fold-change",
+       y = "-log10(P-value)",
+       caption = paste0("Total = ",
+                        length(rownames(dge_results)),
+                        "  Sig = ",
+                        length(rownames(dge_results_sig)))) +
+  theme_bw() +
+  theme(plot.title = element_text(size = 16, hjust = 0.5),
+        axis.title = element_text(size = 14),
+        axis.text = element_text(size = 13),
+        legend.position = "",
+        plot.caption = element_text(size = 13,
+                                    face = "italic"))
+```
+
+### Heatmap
+
+The heatmap is based on genes that are significantly differentially expressed in the "KO vs WT" analysis, and aims to show how the expression of the deregulated genes between the two conditions behaves across all samples. The samples cluster similarly to the original heatmap generated using the top 200 most variable genes after batch effect correction.
+
+```{r}
+#| label: gg-heatmap-test
+#| echo: false
+#| warnings: false
+#| fig.width: 10
+#| fig.height: 6
+#| fig.align: center
+
+# Most significant genes
+topgenes <- dge_results_sig$symbol[1:100]
+
+## Scale by row
+topmat_scaled <- t(scale(t(lrpkm[topgenes,])))
+
+Heatmap(topmat_scaled,
+        cluster_rows = TRUE,
+        cluster_columns = TRUE,
+        # Text
+        show_row_names = FALSE,
+        show_column_names = TRUE,
+        column_title = "Heatmap of most deregulated genes",
+        column_title_gp = gpar(fontsize = 14),
+        column_names_gp = gpar(fontsize = 10),
+        column_names_rot = 45,
+        # Legend
+        heatmap_legend_param = list(title = "Expression\n(Log-RPKM)",
+                                    title_gp = gpar(fontsize = 11),
+                                    labels_gp = gpar(fontsize = 10)),
+        # Annotations
+        top_annotation = HeatmapAnnotation(df = annotations,
+                                           col = annotation_colors,
+                                           annotation_legend_param = list(title_gp = gpar(fontsize = 11),
+                                                                          labels_gp = gpar(fontsize = 10)),
+                                           annotation_name_gp = gpar(fontsize = 11)),
+        # External border
+        border = TRUE,
+        border_gp = gpar(lwd = 0.5),
+        # Cell border
+        rect_gp = gpar(col = NA),
+        # Cell size
+        width = ncol(topmat_scaled)*unit(12, "mm"), 
+        # Expression color
+        col = circlize::colorRamp2(range(topmat_scaled), c("#E4E1E3FF", "#0072B2")))
+
+# Clean the environment
+rm(list = c("topgenes", "topmat_scaled"))
+```

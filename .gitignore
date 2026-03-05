@@ -1,0 +1,6 @@
+**.DS_Store
+.Rproj.user
+default_results
+RNAseq_DGE_cache
+RNAseq_DGE_files
+RNAseq-pipeline.Rproj

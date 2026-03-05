@@ -1,0 +1,22 @@
+{
+    "read_files": "[ /mnt/fastq/H2LFWBBXY_2_220UDI-idt-UMI_1.fastq.gz, /mnt/fastq/H2LFWBBXY_2_220UDI-idt-UMI_2.fastq.gz]",
+    "expected_format": "ISF",
+    "compatible_fragment_ratio": 1.0,
+    "num_compatible_fragments": 43068466,
+    "num_assigned_fragments": 43068466,
+    "num_frags_with_concordant_consistent_mappings": 41252250,
+    "num_frags_with_inconsistent_or_orphan_mappings": 1929069,
+    "strand_mapping_bias": 0.9999959517523543,
+    "MSF": 0,
+    "OSF": 0,
+    "ISF": 41252250,
+    "MSR": 0,
+    "OSR": 0,
+    "ISR": 167,
+    "SF": 1258178,
+    "SR": 670724,
+    "MU": 0,
+    "OU": 0,
+    "IU": 0,
+    "U": 0
+}
