@@ -1,0 +1,15 @@
+{
+    "salmon_version": "1.10.2",
+    "threads": "20",
+    "libType": "A",
+    "validateMappings": [],
+    "gcBias": [],
+    "seqBias": [],
+    "posBias": [],
+    "index": "/mnt/index/transcripts_index",
+    "geneMap": "/mnt/index/gencode.v49.basic.annotation.gtf",
+    "mates1": "/mnt/fastq/H2LFWBBXY_1_148UDI-idt-UMI_1.fastq.gz",
+    "mates2": "/mnt/fastq/H2LFWBBXY_1_148UDI-idt-UMI_2.fastq.gz",
+    "output": "/home/148",
+    "auxDir": "aux_info"
+}
