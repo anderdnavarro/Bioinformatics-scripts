@@ -302,7 +302,7 @@ dge_matrix <- DGEList(counts = counts,
                       genes = genes)
 
 # Clean the environment
-rm(list = c("meta.file", "salmon.dir", "ah", "edb", "counts", "genes_edb", "genes"))
+rm(list = c("meta.file", "salmon.dir", "ah", "edb", "counts", "genes_edb", "genes", "metadata"))
 ```
 
 These are the samples that are going to be analyzed:
@@ -311,7 +311,8 @@ These are the samples that are going to be analyzed:
 #| label: table-metadata
 #| echo: false
 
-metadata %>% 
+as_tibble(dge_matrix$samples) %>% 
+  dplyr::select(sample_id, group, cell_line, replicate, label) %>% 
   tibble::column_to_rownames("label") %>% 
   DT::datatable(rownames = TRUE,
                 options = list(
@@ -343,18 +344,22 @@ write_delim(as_tibble(dge_matrix$counts, rownames = "geneid") ,
 #| include: false
 
 # Create a sample palette
-if (length(metadata$label) > 10){
-    mycol <- colorRampPalette(ggsci::pal_npg("nrc")(10))(length(metadata$label))
+n_samples <- nrow(dge_matrix$samples)
+if (n_samples > 10){
+    mycol <- colorRampPalette(ggsci::pal_npg("nrc")(10))(n_samples)
 } else {
-    mycol <- ggsci::pal_npg("nrc")(length(metadata$label))
+    mycol <- ggsci::pal_npg("nrc")(n_samples)
 }
 
 # Create a PCA/Heatmap palette
-annotations <- data.frame(row.names = metadata$label,
-                          cell_line = metadata$cell_line,
-                          u1 = metadata$group)
+annotations <- data.frame(row.names = dge_matrix$samples$label,
+                          cell_line = dge_matrix$samples$cell_line,
+                          u1 = dge_matrix$samples$group)
 annotation_colors = list(u1 = c(U1_mut = "#fe5f55", U1_wt = "#577399"),
                          cell_line = c(JVM3 = "#94d2bd", HG3 = "#e9d8a6", MEC1 = "#ee9b00"))
+
+# Clean the environment
+rm(n_samples)
 ```
 
 ```{r}
@@ -362,8 +367,8 @@ annotation_colors = list(u1 = c(U1_mut = "#fe5f55", U1_wt = "#577399"),
 #| include: false
 
 # Guide to understand matrices: https://bioconductor.org/packages/release/workflows/vignettes/RNAseq123/inst/doc/designmatrices.html
-design <- model.matrix(~0 + metadata$group)
-colnames(design) <- levels(metadata$group)
+design <- model.matrix(~0 + dge_matrix$samples$group)
+colnames(design) <- levels(dge_matrix$samples$group)
 
 # Make the contrast matrix
 contr.matrix <- makeContrasts(
@@ -603,7 +608,7 @@ as_tibble(lrpkm,
                       names_to = "samples",
                       values_to = "values") %>% 
   dplyr::mutate(samples = factor(samples,
-                                 levels = metadata$sample_id)) %>% 
+                                 levels = dge_matrix$samples$sample_id)) %>% 
   ggplot(aes(x = samples,
              y = values,
              fill = samples)) + 
@@ -854,7 +859,7 @@ As we have seen before, the cell line of origin is a huge batch effect. If we do
 # Batch effect calculation
 lrpkm_withoutBatch <- removeBatchEffect(lrpkm,
                                         design = design,
-                                        batch  = metadata$cell_line)
+                                        batch  = dge_matrix$samples$cell_line)
 ```
 
 After removing the cell line batch effect, we can see in both the PCA and the heatmaps that now the samples cluster much better by the U1 status condition.
@@ -1065,8 +1070,8 @@ Considering the detected batch effect, the contrast matrix that will be used for
 #| include: false
 
 # Guide to understand matrices: https://bioconductor.org/packages/release/workflows/vignettes/RNAseq123/inst/doc/designmatrices.html
-design <- model.matrix(~0 + metadata$group + metadata$cell_line)
-colnames(design) <- c(levels(metadata$group), levels(metadata$cell_line)[c(2:3)])
+design <- model.matrix(~0 + dge_matrix$samples$group + dge_matrix$samples$cell_line)
+colnames(design) <- c(levels(dge_matrix$samples$group), tail(levels(dge_matrix$samples$cell_line))[-1])
 
 # Make the contrast matrix
 contr.matrix <- makeContrasts(
@@ -1448,8 +1453,8 @@ dge_results_sig %>%
 
 limma_fit <- voomLmFit(dge_matrix,
           design = design,
-          block = glue::glue("{metadata$cell_line}_{metadata$group}"),
-          plot=TRUE,
+          block = glue::glue("{dge_matrix$samples$cell_line}_{dge_matrix$samples$group}"),
+          plot=FALSE,
           save.plot=TRUE)
 
 limma_fit <- contrasts.fit(limma_fit,
