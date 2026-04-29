@@ -1093,7 +1093,7 @@ Heatmap(MDS_res$distance.matrix,
         col = circlize::colorRamp2(range(MDS_res$distance.matrix),rev(brewer.pal(9, "Blues"))[c(1,9)]))
 
 # Clean the environment
-rm(list = c("MDS_res", "lrpkm_withoutBatch", "lrpkm"))
+rm(list = c("MDS_res"))
 ```
 :::
 
@@ -1419,7 +1419,7 @@ dge_results <- as_tibble(edgeR_fit_test$table,
   dplyr::rename(ensembl_id = geneid,
                 entrez_id = entrezid,
                 log2fc = logFC,
-                log2cpm = logCPM,
+                log2cpm = logCPM, # edgeR = log2(mean(cpm)) || limma = mean(log2(cpm))
                 pvalue = PValue) %>% 
   dplyr::arrange(pvalue, pvalue_BH, log2fc) %>% 
   dplyr::select(ensembl_id, log2cpm, tpm, log2fc, pvalue, pvalue_BH, pvalue_bonferroni, down_up, symbol, entrez_id, length)
@@ -1438,7 +1438,7 @@ qs_save(dge_results_sig,
         file = glue::glue("{out.dir}/{prefix}_all_contrasts_significant_genes_results_edgeR4.qs2"))
 
 # Clean the environment
-rm(list=c("tpms", "is.de", "edgeR_fit", "edgeR_fit_test"))
+rm(list=c("is.de", "edgeR_fit", "edgeR_fit_test"))
 ```
 
 ```{r}
@@ -1634,7 +1634,7 @@ mean_tpms <- tpms %>%
 
 # Export the results
 dge_results <- bind_cols(limma_fit_test$genes,
-                         log2cpm = limma_fit_test$Amean,
+                         log2cpm = limma_fit_test$Amean, # edgeR = log2(mean(cpm)) || limma = mean(log2(cpm))
                          log2fc = as.data.frame(limma_fit_test$coefficients)[,1],
                          t = as.data.frame(limma_fit_test$t)[,1],
                          pvalue = as.data.frame(limma_fit_test$p.value)[,1]) %>% 
@@ -1650,7 +1650,7 @@ dge_results <- bind_cols(limma_fit_test$genes,
   dplyr::rename(ensembl_id = geneid,
                 entrez_id = entrezid) %>% 
   dplyr::arrange(pvalue, pvalue_BH, log2fc) %>% 
-  dplyr::select(ensembl_id, log2cpm, tpm, log2fc, pvalue, pvalue_BH, pvalue_bonferroni, down_up, symbol, entrez_id, length)
+  dplyr::select(ensembl_id, log2cpm, tpm, log2fc, t, pvalue, pvalue_BH, pvalue_bonferroni, down_up, symbol, entrez_id, length)
 
 dge_results_sig <- dge_results %>% 
   dplyr::filter(down_up != 0)
@@ -1666,7 +1666,7 @@ qs_save(dge_results_sig,
         file = glue::glue("{out.dir}/{prefix}_all_contrasts_significant_genes_results_limma.qs2"))
 
 # Clean the environment
-rm(list=c("tpms", "is.de", "limma_fit", "limma_fit_test"))
+rm(list=c("is.de", "limma_fit", "limma_fit_test"))
 ```
 
 ```{r}
@@ -1810,7 +1810,7 @@ The heatmap is based on genes that are significantly differentially expressed in
 topgenes <- dge_results_sig$symbol[1:100]
 
 ## Scale by row
-topmat_scaled <- t(scale(t(lrpkm[topgenes,])))
+topmat_scaled <- t(scale(t(lrpkm_withoutBatch[topgenes,])))
 
 Heatmap(topmat_scaled,
         cluster_rows = TRUE,
