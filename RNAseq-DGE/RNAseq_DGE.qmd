@@ -526,7 +526,7 @@ lrpkm <- rpkm(dge_matrix,
               gene.length	= "length",
               log = TRUE)
 
-## Plot
+## Density plot
 as_tibble(lrpkm,
           rownames = "gene_id") %>% 
   tidyr::pivot_longer(cols = -gene_id,
@@ -547,6 +547,35 @@ as_tibble(lrpkm,
         axis.text = element_text(size = 13),
         axis.title= element_text(size = 16),
         legend.position = "")
+
+## Boxplot
+as_tibble(lrpkm,
+          rownames = "Genes") %>% 
+  tidyr::pivot_longer(cols = -Genes,
+                      names_to = "samples",
+                      values_to = "values") %>% 
+  dplyr::mutate(samples = factor(samples,
+                                 levels = dge_matrix$samples$sample_id)) %>% 
+  ggplot(aes(x = samples,
+             y = values,
+             fill = samples)) + 
+  geom_boxplot() + 
+  geom_line(data = as_tibble(dge_matrix$samples, rownames = "samples"),
+            aes(x = samples, y = Inf,
+                color = cell_line,
+                group = cell_line),
+            linewidth = 5) +
+  scale_fill_manual(values = alpha(mycol, 0.7),
+                    guide = "none") +
+  scale_color_manual(values = annotation_colors$cell_line) +
+  labs(title = "Expression distribution - Filtered data",
+       y = "Log-RPKM",
+       x = "") +
+  theme_bw() +
+  theme(plot.title = element_text(size = 20, hjust = 0.5),
+        axis.text = element_text(size = 13, angle = 45, hjust = 1),
+        axis.title= element_text(size = 16),
+        legend.position = "top")
 ```
 
 ### Normalizing gene expression distributions
@@ -613,7 +642,14 @@ as_tibble(lrpkm,
              y = values,
              fill = samples)) + 
   geom_boxplot() + 
-  scale_fill_manual(values = alpha(mycol, 0.7)) +
+  geom_line(data = as_tibble(dge_matrix$samples, rownames = "samples"),
+            aes(x = samples, y = Inf,
+                color = cell_line,
+                group = cell_line),
+            linewidth = 5) +
+  scale_fill_manual(values = alpha(mycol, 0.7),
+                    guide = "none") +
+  scale_color_manual(values = annotation_colors$cell_line) +
   labs(title = "Expression distribution - Filtered and normalized data",
        y = "Log-RPKM",
        x = "") +
@@ -621,7 +657,7 @@ as_tibble(lrpkm,
   theme(plot.title = element_text(size = 20, hjust = 0.5),
         axis.text = element_text(size = 13, angle = 45, hjust = 1),
         axis.title= element_text(size = 16),
-        legend.position = "")
+        legend.position = "top")
 ```
 
 ```{r}
@@ -680,8 +716,8 @@ biplot(pca_m,
        legendIconSize = 3,
        labSize = 5) +
   labs(title = "PCA",
-       color = "Cell line",
-       shape = "U1 status") +
+       color = "U1 status",
+       shape = "Cell line") +
   theme_bw() +
   theme(plot.title = element_text(size = 20, hjust = 0.5),
         axis.title = element_text(size = 16),
@@ -903,8 +939,8 @@ biplot(pca_m,
        legendIconSize = 3,
        labSize = 5) +
   labs(title = "PCA",
-       color = "Cell line",
-       shape = "U1 status") +
+       color = "U1 status",
+       shape = "Cell line") +
   theme_bw() +
   theme(plot.title = element_text(size = 20, hjust = 0.5),
         axis.title = element_text(size = 16),
