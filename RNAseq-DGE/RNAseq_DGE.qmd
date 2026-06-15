@@ -22,6 +22,7 @@ execute:
 library(qs2)
 library(readr)
 library(dplyr)
+library(purrr)
 library(scales)
 
 # Databases
@@ -1317,9 +1318,13 @@ lfcCutoff <- log2(1.3)
 pCutoff <- 0.05
 
 # Treat implementation
-edgeR_fit_test <- glmTreat(edgeR_fit,
-                           contrast = contr.matrix,
-                           lfc = lfcCutoff)
+edgeR_fit_test <- as.data.frame(contr.matrix) %>% 
+  purrr::map(\(x) {
+    glmTreat(edgeR_fit,
+             contrast = x,
+             lfc = lfcCutoff)
+  }) %>% 
+  rlang::set_names(colnames(contr.matrix))
 
 # Normal QL implementation
 # edgeR_model_fit_test <- glmQLFTest(edgeR_model_fit,
@@ -1332,12 +1337,39 @@ The number of deregulated genes using the `glmQLFit-glmTreat` approach is:
 #| label: table-summary-dge-edgeR
 #| echo: false
 
-is.de <- decideTests(edgeR_fit_test,
-                     adjust.method = "BH",
-                     p.value = pCutoff)
-colnames(is.de) <- colnames(contr.matrix)
+is.de <- edgeR_fit_test %>% 
+  imap(\(x, idx) {
+    tmp <- decideTests(x,
+                       adjust.method = "BH",
+                       p.value = pCutoff) %>% 
+      as.data.frame()
+    colnames(tmp) <- idx
+    return(tmp)
+  }) %>% 
+  bind_cols() %>% 
+  as_tibble(rownames = "entrezid") %>% 
+  tidyr::pivot_longer(cols = -entrezid,
+                      names_to = "contr",
+                      values_to = "de") %>% 
+  dplyr::mutate(de = de %>% 
+                  recode_values(
+                    -1 ~ "Down",
+                    0 ~ "Not sig",
+                    1 ~ "Up"
+                  ),
+                de = factor(de,
+                            levels = c("Up", "Not sig", "Down")),
+                contr = factor(contr,
+                               levels = colnames(contr.matrix)))
 
-is.de.sum <- summary(is.de)
+is.de.sum <- is.de %>% 
+  dplyr::group_by(contr, de) %>% 
+  dplyr::count() %>% 
+  dplyr::ungroup() %>% 
+  dplyr::arrange(contr) %>% 
+  tidyr::pivot_wider(names_from = contr,
+                     values_from = n) %>% 
+  tibble::column_to_rownames("de")
 kableExtra::kable(is.de.sum, 
                   align = "c") %>% 
   kableExtra::kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"),
@@ -1360,34 +1392,69 @@ The magnitude of the differential expression changes can be visualized with a fi
 ```{r}
 #| label: gg-edgeR-mdplot
 #| echo: false
+
+mdplot_list <- edgeR_fit_test %>% 
+  imap(\(x, idx) {
+    x$table %>% 
+      as_tibble(rownames = "entrezid") %>% 
+      dplyr::left_join(is.de %>%
+                         dplyr::filter(contr == idx) %>% 
+                         dplyr::select(-contr),
+                       by = "entrezid") %>% 
+      dplyr::left_join(x$genes %>% 
+                         dplyr::select(entrezid, symbol) %>% 
+                         dplyr::mutate(entrezid = as.character(entrezid)),
+                       by = "entrezid") %>% 
+      ggplot(aes(x = logCPM, y = logFC, color = de, size = de)) +
+      geom_point(alpha = 0.8) +
+      ggrepel::geom_label_repel(data = . %>% 
+                                  dplyr::filter(de != "Not sig") %>% 
+                                  dplyr::group_by(de) %>% 
+                                  dplyr::arrange(PValue) %>% 
+                                  dplyr::slice_head(n = 5),
+                                aes(label = symbol),
+                                size = 3,
+                                box.padding = 0.3,
+                                max.overlaps = Inf,
+                                alpha = 0.8,
+                                show.legend = FALSE) +
+      scale_size_manual(values = c("Not sig" = 0.2,
+                                   "Up" = 0.7,
+                                   "Down" = 0.7),
+                        guide = "none") +
+      scale_color_manual(values = c("Not sig" = "black",
+                                    "Up" = "#e76f51",
+                                    "Down" = "#1976d2")) +
+      labs(title = "Mean-Difference plot",
+           subtitle = idx,
+           x = "Average log2-CPM",
+           y = "log2-fold-change",
+           color = "Direction") +
+      theme_bw() +
+      theme(plot.title = element_text(size = 14, hjust = 0.5),
+            plot.subtitle = element_text(size = 12, hjust = 0.5),
+            axis.title = element_text(size = 12),
+            axis.text = element_text(size = 11),
+            legend.text = element_text(size = 11),
+            legend.position = "top")
+  })
+```
+
+```{r}
+#| label: gg-edgeR-mdplot-panel
+#| echo: false
+#| results: asis
 #| fig.width: 9
 #| fig.height: 6
 #| fig.align: center
 
-edgeR_fit_test$table %>% 
-  dplyr::mutate(sig = as.data.frame(is.de)[,1],
-                sig = factor(sig,
-                             levels = c(-1,0,1),
-                             labels = c("Down", "Not sig", "Up"))) %>% 
-  ggplot(aes(x = logCPM, y = logFC, color = sig, size = sig)) +
-  geom_point(alpha = 0.8) +
-  scale_size_manual(values = c("Not sig" = 0.2,
-                               "Up" = 0.7,
-                               "Down" = 0.7),
-                    guide = "none") +
-  scale_color_manual(values = c("Not sig" = "black",
-                                "Up" = "#e76f51",
-                                "Down" = "#1976d2")) +
-  labs(title = "Mean-Difference plot",
-       x = "Average log2-CPM",
-       y = "log2-fold-change",
-       color = "Direction") +
-  theme_bw() +
-  theme(plot.title = element_text(size = 16, hjust = 0.5),
-        axis.title = element_text(size = 14),
-        axis.text = element_text(size = 13),
-        legend.text = element_text(size = 12),
-        legend.position = "top")
+cat("::: panel-tabset\n")
+for (contrast in names(mdplot_list)) {
+  cat(sprintf("\n## %s\n", contrast))
+  print(mdplot_list[[contrast]])
+  cat("\n\n")
+}
+cat(":::\n")
 ```
 
 ```{r}
@@ -1404,28 +1471,29 @@ mean_tpms <- tpms %>%
                    .groups = "drop")
 
 # Export the results
-dge_results <- as_tibble(edgeR_fit_test$table,
-                         rownames = "entrezid") %>% 
-  dplyr::left_join(edgeR_fit_test$genes %>% 
-                     dplyr::mutate(entrezid = as.character(entrezid)),
-                   by = "entrezid") %>% 
-  dplyr::left_join(as_tibble(as.data.frame(is.de), rownames = "entrezid") %>% 
-                     dplyr::rename(down_up = colnames(.)[2]),
-                   by = "entrezid") %>% 
-  dplyr::left_join(mean_tpms,
-                   by = "entrezid") %>% 
-  dplyr::mutate(pvalue_BH = p.adjust(PValue, method = "BH"),
-                pvalue_bonferroni = p.adjust(PValue, method = "bonferroni")) %>% 
-  dplyr::rename(ensembl_id = geneid,
-                entrez_id = entrezid,
-                log2fc = logFC,
-                log2cpm = logCPM, # edgeR = log2(mean(cpm)) || limma = mean(log2(cpm))
-                pvalue = PValue) %>% 
-  dplyr::arrange(pvalue, pvalue_BH, log2fc) %>% 
-  dplyr::select(ensembl_id, log2cpm, tpm, log2fc, pvalue, pvalue_BH, pvalue_bonferroni, down_up, symbol, entrez_id, length)
-
-dge_results_sig <- dge_results %>% 
-  dplyr::filter(down_up != 0)
+dge_results <- edgeR_fit_test %>% 
+  imap(\(x, idx) {
+    x$table %>% 
+      as_tibble(rownames = "entrezid") %>% 
+      dplyr::left_join(x$genes %>% 
+                         dplyr::mutate(entrezid = as.character(entrezid)),
+                       by = "entrezid") %>% 
+      dplyr::left_join(is.de %>% 
+                         dplyr::filter(contr == idx) %>%
+                         dplyr::select(-contr) %>% 
+                         dplyr::rename(down_up = de),
+                       by = "entrezid") %>% 
+      dplyr::left_join(mean_tpms,
+                       by = "entrezid") %>% 
+      dplyr::mutate(pvalue_BH = p.adjust(PValue, method = "BH"),
+                    pvalue_bonferroni = p.adjust(PValue, method = "bonferroni")) %>% 
+      dplyr::rename(ensembl_id = geneid,
+                    entrez_id = entrezid,
+                    log2fc = logFC,
+                    log2cpm = logCPM,
+                    pvalue = PValue) %>% 
+      dplyr::arrange(pvalue, pvalue_BH, log2fc) %>% 
+      dplyr::select(ensembl_id, log2cpm, tpm, log2fc, pvalue, pvalue_BH, pvalue_bonferroni, down_up, symbol, entrez_id, length)})
 
 # Save the results in an excel file
 openxlsx::write.xlsx(dge_results,
@@ -1434,36 +1502,9 @@ openxlsx::write.xlsx(dge_results,
 # Save the results in qs file to be imported with R
 qs_save(dge_results,
         file = glue::glue("{out.dir}/{prefix}_all_contrasts_differential_expression_results_edgeR4.qs2"))
-qs_save(dge_results_sig,
-        file = glue::glue("{out.dir}/{prefix}_all_contrasts_significant_genes_results_edgeR4.qs2"))
 
 # Clean the environment
 rm(list=c("is.de", "edgeR_fit", "edgeR_fit_test"))
-```
-
-```{r}
-#| label: table-dge-result-edgeR
-#| echo: false
-#| results: asis
-
-dge_results_sig %>% 
-  dplyr::mutate(log2cpm = round(log2cpm, 4),
-                tpm = round(tpm, 4),
-                log2fc = round(log2fc, 4),
-                pvalue = scientific(pvalue, digits = 3),
-                pvalue_BH = scientific(pvalue_BH, digits = 3),
-                pvalue_bonferroni = scientific(pvalue_bonferroni, digits = 3)) %>%
-  DT::datatable(rownames = FALSE,
-                options = list(
-                  pageLength = 10,
-                  lengthMenu = c(10, 20, 50, 100),
-                  scrollX = TRUE,
-                  initComplete = JS(
-                    "function(settings, json) {",
-                    "$(this.api().table().header()).css({'font-size': '14px'});",
-                    "}"))) %>% 
-  DT::formatStyle(columns = c(0:(ncol(dge_results_sig)-1)),
-                  fontSize = '14px')
 ```
 
 ### Limma
@@ -1561,11 +1602,32 @@ The number of deregulated genes using the `voomLmFit-treat` approach is:
 #| echo: false
 
 is.de <- decideTests(limma_fit_test,
-                     adjust.method = "BH",
-                     p.value = pCutoff)
-colnames(is.de) <- colnames(contr.matrix)
+            adjust.method = "BH",
+            p.value = pCutoff) %>% 
+  as.data.frame() %>% 
+  as_tibble(rownames = "entrezid") %>% 
+  tidyr::pivot_longer(cols = -entrezid,
+                      names_to = "contr",
+                      values_to = "de") %>% 
+  dplyr::mutate(de = de %>% 
+                  recode_values(
+                    -1 ~ "Down",
+                    0 ~ "Not sig",
+                    1 ~ "Up"
+                  ),
+                de = factor(de,
+                            levels = c("Up", "Not sig", "Down")),
+                contr = factor(contr,
+                               levels = colnames(contr.matrix)))
 
-is.de.sum <- summary(is.de)
+is.de.sum <- is.de %>% 
+  dplyr::group_by(contr, de) %>% 
+  dplyr::count() %>% 
+  dplyr::ungroup() %>% 
+  dplyr::arrange(contr) %>% 
+  tidyr::pivot_wider(names_from = contr,
+                     values_from = n) %>% 
+  tibble::column_to_rownames("de")
 kableExtra::kable(is.de.sum, 
                   align = "c") %>% 
   kableExtra::kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"),
@@ -1588,35 +1650,69 @@ The magnitude of the differential expression changes can be visualized with a fi
 ```{r}
 #| label: gg-limma-mdplot
 #| echo: false
+
+mdplot_list <- colnames(contr.matrix) %>% 
+  map(\(idx) {
+    tibble(logCPM = limma_fit_test$Amean,
+           log2fc = as.data.frame(limma_fit_test$coefficients)[,idx],
+           entrezid = as.character(limma_fit_test$genes$entrezid),
+           symbol = as.character(limma_fit_test$genes$symbol),
+           pvalue = limma_fit_test$p.value[,idx]) %>% 
+      dplyr::left_join(is.de %>%
+                         dplyr::filter(contr == idx) %>% 
+                         dplyr::select(-contr),
+                       by = "entrezid") %>% 
+      ggplot(aes(x = logCPM, y = log2fc, color = de, size = de)) +
+      geom_point(alpha = 0.8) +
+      ggrepel::geom_label_repel(data = . %>% 
+                                  dplyr::filter(de != "Not sig") %>% 
+                                  dplyr::group_by(de) %>% 
+                                  dplyr::arrange(pvalue) %>% 
+                                  dplyr::slice_head(n = 5),
+                                aes(label = symbol),
+                                size = 3,
+                                box.padding = 0.3,
+                                max.overlaps = Inf,
+                                alpha = 0.8,
+                                show.legend = FALSE) +
+      scale_size_manual(values = c("Not sig" = 0.2,
+                                   "Up" = 0.7,
+                                   "Down" = 0.7),
+                        guide = "none") +
+      scale_color_manual(values = c("Not sig" = "black",
+                                    "Up" = "#e76f51",
+                                    "Down" = "#1976d2")) +
+      labs(title = "Mean-Difference plot",
+           subtitle = idx,
+           x = "Average log2-CPM",
+           y = "log2-fold-change",
+           color = "Direction") +
+      theme_bw() +
+      theme(plot.title = element_text(size = 14, hjust = 0.5),
+            plot.subtitle = element_text(size = 12, hjust = 0.5),
+            axis.title = element_text(size = 12),
+            axis.text = element_text(size = 11),
+            legend.text = element_text(size = 11),
+            legend.position = "top")
+  }) %>% 
+  rlang::set_names(colnames(contr.matrix))
+```
+
+```{r}
+#| label: gg-limma-mdplot-panel
+#| echo: false
+#| results: asis
 #| fig.width: 9
 #| fig.height: 6
 #| fig.align: center
 
-tibble(logCPM = limma_fit_test$Amean,
-       log2fc = as.data.frame(limma_fit_test$coefficients)[,1]) %>% 
-  dplyr::mutate(sig = as.data.frame(is.de)[,1],
-                sig = factor(sig,
-                             levels = c(-1,0,1),
-                             labels = c("Down", "Not sig", "Up"))) %>% 
-  ggplot(aes(x = logCPM, y = log2fc, color = sig, size = sig)) +
-  geom_point(alpha = 0.8) +
-  scale_size_manual(values = c("Not sig" = 0.2,
-                               "Up" = 0.7,
-                               "Down" = 0.7),
-                    guide = "none") +
-  scale_color_manual(values = c("Not sig" = "black",
-                                "Up" = "#e76f51",
-                                "Down" = "#1976d2")) +
-  labs(title = "Mean-Difference plot",
-       x = "Average log2-CPM",
-       y = "log2-fold-change",
-       color = "Direction") +
-  theme_bw() +
-  theme(plot.title = element_text(size = 16, hjust = 0.5),
-        axis.title = element_text(size = 14),
-        axis.text = element_text(size = 13),
-        legend.text = element_text(size = 12),
-        legend.position = "top")
+cat("::: panel-tabset\n")
+for (contrast in names(mdplot_list)) {
+  cat(sprintf("\n## %s\n", contrast))
+  print(mdplot_list[[contrast]])
+  cat("\n\n")
+}
+cat(":::\n")
 ```
 
 ```{r}
@@ -1633,27 +1729,29 @@ mean_tpms <- tpms %>%
                    .groups = "drop")
 
 # Export the results
-dge_results <- bind_cols(limma_fit_test$genes,
-                         log2cpm = limma_fit_test$Amean, # edgeR = log2(mean(cpm)) || limma = mean(log2(cpm))
-                         log2fc = as.data.frame(limma_fit_test$coefficients)[,1],
-                         t = as.data.frame(limma_fit_test$t)[,1],
-                         pvalue = as.data.frame(limma_fit_test$p.value)[,1]) %>% 
-  as_tibble() %>% 
-  dplyr::mutate(entrezid = as.character(entrezid)) %>% 
-  dplyr::left_join(as_tibble(as.data.frame(is.de), rownames = "entrezid") %>% 
-                     dplyr::rename(down_up = colnames(.)[2]),
-                   by = "entrezid") %>% 
-  dplyr::left_join(mean_tpms,
-                   by = "entrezid") %>% 
-  dplyr::mutate(pvalue_BH = p.adjust(pvalue, method = "BH"),
-                pvalue_bonferroni = p.adjust(pvalue, method = "bonferroni")) %>% 
-  dplyr::rename(ensembl_id = geneid,
-                entrez_id = entrezid) %>% 
-  dplyr::arrange(pvalue, pvalue_BH, log2fc) %>% 
-  dplyr::select(ensembl_id, log2cpm, tpm, log2fc, t, pvalue, pvalue_BH, pvalue_bonferroni, down_up, symbol, entrez_id, length)
-
-dge_results_sig <- dge_results %>% 
-  dplyr::filter(down_up != 0)
+dge_results <- colnames(contr.matrix) %>% 
+  map(\(idx) {
+    bind_cols(limma_fit_test$genes,
+              log2cpm = limma_fit_test$Amean, # edgeR = log2(mean(cpm)) || limma = mean(log2(cpm))
+              log2fc = as.data.frame(limma_fit_test$coefficients)[,idx],
+              t = as.data.frame(limma_fit_test$t)[,idx],
+              pvalue = as.data.frame(limma_fit_test$p.value)[,idx]) %>% 
+      as_tibble() %>% 
+      dplyr::mutate(entrezid = as.character(entrezid)) %>% 
+      dplyr::left_join(is.de %>%
+                         dplyr::filter(contr == idx) %>% 
+                         dplyr::select(-contr) %>% 
+                         dplyr::rename(down_up = de),
+                       by = "entrezid") %>% 
+      dplyr::left_join(mean_tpms,
+                       by = "entrezid") %>% 
+      dplyr::mutate(pvalue_BH = p.adjust(pvalue, method = "BH"),
+                    pvalue_bonferroni = p.adjust(pvalue, method = "bonferroni")) %>% 
+      dplyr::rename(ensembl_id = geneid,
+                    entrez_id = entrezid) %>% 
+      dplyr::arrange(pvalue, pvalue_BH, log2fc) %>% 
+      dplyr::select(ensembl_id, log2cpm, tpm, log2fc, t, pvalue, pvalue_BH, pvalue_bonferroni, down_up, symbol, entrez_id, length)}) %>% 
+  rlang::set_names(colnames(contr.matrix))
 
 # Save the results in an excel file
 openxlsx::write.xlsx(dge_results,
@@ -1662,36 +1760,9 @@ openxlsx::write.xlsx(dge_results,
 # Save the results in qs file to be imported with R
 qs_save(dge_results,
         file = glue::glue("{out.dir}/{prefix}_all_contrasts_differential_expression_results_limma.qs2"))
-qs_save(dge_results_sig,
-        file = glue::glue("{out.dir}/{prefix}_all_contrasts_significant_genes_results_limma.qs2"))
 
 # Clean the environment
 rm(list=c("is.de", "limma_fit", "limma_fit_test"))
-```
-
-```{r}
-#| label: table-dge-result-limma
-#| echo: false
-#| results: asis
-
-dge_results_sig %>% 
-  dplyr::mutate(log2cpm = round(log2cpm, 4),
-                tpm = round(tpm, 4),
-                log2fc = round(log2fc, 4),
-                pvalue = scientific(pvalue, digits = 3),
-                pvalue_BH = scientific(pvalue_BH, digits = 3),
-                pvalue_bonferroni = scientific(pvalue_bonferroni, digits = 3)) %>%
-  DT::datatable(rownames = FALSE,
-                options = list(
-                  pageLength = 10,
-                  lengthMenu = c(10, 20, 50, 100),
-                  scrollX = TRUE,
-                  initComplete = JS(
-                    "function(settings, json) {",
-                    "$(this.api().table().header()).css({'font-size': '14px'});",
-                    "}"))) %>% 
-  DT::formatStyle(columns = c(0:(ncol(dge_results_sig)-1)),
-                  fontSize = '14px')
 ```
 
 ## Data visualization
@@ -1721,22 +1792,40 @@ The P-Value histogram displays a bimodal distribution, with one peak correspondi
 ```{r}
 #| label: gg-pvalue-hist
 #| echo: false
+
+phist_list <- dge_results %>% 
+  imap(\(x, idx) {
+    x %>% 
+      ggplot(aes(x = pvalue)) + 
+      geom_histogram(bins = 100) +
+      labs(title = "P-Value Histogram",
+           subtitle = idx,
+           x = "P-Value",
+           y = "Count") +
+      theme_bw() +
+      theme(plot.title = element_text(size = 16, hjust = 0.5),
+            plot.subtitle = element_text(size = 13, hjust = 0.5),
+            axis.title = element_text(size = 14),
+            axis.text = element_text(size = 13),
+            legend.text = element_text(size = 12),
+            legend.position = "top")})
+```
+
+```{r}
+#| label: gg-pvalue-hist-panel
+#| echo: false
+#| results: asis
 #| fig.width: 11
 #| fig.height: 6
 #| fig.align: center
 
-dge_results %>% 
-  ggplot(aes(x = pvalue)) + 
-  geom_histogram(bins = 100) +
-  labs(title = glue::glue("P-Value Histogram"),
-       x = "P-Value",
-       y = "Count") +
-  theme_bw() +
-  theme(plot.title = element_text(size = 16, hjust = 0.5),
-        axis.title = element_text(size = 14),
-        axis.text = element_text(size = 13),
-        legend.text = element_text(size = 12),
-        legend.position = "top")
+cat("::: panel-tabset\n")
+for (contrast in names(phist_list)) {
+  cat(sprintf("\n## %s\n", contrast))
+  print(phist_list[[{contrast}]])
+  cat("\n\n")
+}
+cat(":::\n")
 ```
 
 ### Volcano plot
@@ -1748,50 +1837,70 @@ The volcano plot displays the statistical significance (`−log10(p-value)`, y-a
 ```{r}
 #| label: gg-volcano
 #| echo: false
+
+volcano_list <- dge_results %>% 
+  imap(\(x, idx) {
+    x %>% 
+      dplyr::select(entrez_id, log2fc, pvalue, symbol) %>% 
+      dplyr::mutate(group = case_when(abs(log2fc) >= lfcCutoff & pvalue <= pCutoff ~ "both",
+                                      abs(log2fc) >= lfcCutoff & pvalue > pCutoff ~ "fc",
+                                      abs(log2fc) < lfcCutoff & pvalue <= pCutoff ~ "pvalue",
+                                      .default = "none"),
+                    group = factor(group)) %>% 
+      ggplot(aes(x = log2fc, y = -log10(pvalue), color = group)) +
+      geom_point(size = 1) +
+      scale_color_manual(values = c("both" = "red",
+                                    "fc" = "#30A56C",
+                                    "pvalue" = "#2380CD",
+                                    "none" = "black")) +
+      geom_vline(xintercept = c(-lfcCutoff, lfcCutoff),
+                 linetype = "longdash",
+                 linewidth = 0.7) + 
+      geom_hline(yintercept = -log10(pCutoff),
+                 linetype = "longdash",
+                 linewidth = 0.7) +
+      geom_text_repel(data = . %>% head(10),
+                      mapping = aes(x = log2fc,
+                                    y = -log10(pvalue),
+                                    label = symbol),
+                      hjust = 1.2,
+                      color = "black",
+                      size = 4) +
+      labs(title = "Volcano plot",
+           subtitle = idx,
+           x = "log2-fold-change",
+           y = "-log10(P-value)",
+           caption = paste0("Total = ",
+                            nrow(x),
+                            "  Sig = ",
+                            nrow(x %>% 
+                                   dplyr::filter(down_up != "Not sig")))) +
+      theme_bw() +
+      theme(plot.title = element_text(size = 16, hjust = 0.5),
+            plot.subtitle = element_text(size = 13, hjust = 0.5),
+            axis.title = element_text(size = 14),
+            axis.text = element_text(size = 13),
+            legend.position = "",
+            plot.caption = element_text(size = 13,
+                                        face = "italic"))
+  })
+```
+
+```{r}
+#| label: gg-volcano-panel
+#| echo: false
+#| results: asis
 #| fig.width: 10
 #| fig.height: 7
 #| fig.align: center
 
-dge_results %>% 
-  dplyr::select(entrez_id, log2fc, pvalue, symbol) %>% 
-  dplyr::mutate(group = case_when(abs(log2fc) >= lfcCutoff & pvalue <= pCutoff ~ "both",
-                                  abs(log2fc) >= lfcCutoff & pvalue > pCutoff ~ "fc",
-                                  abs(log2fc) < lfcCutoff & pvalue <= pCutoff ~ "pvalue",
-                                  .default = "none"),
-                group = factor(group)) %>% 
-  ggplot(aes(x = log2fc, y = -log10(pvalue), color = group)) +
-  geom_point(size = 1) +
-  scale_color_manual(values = c("both" = "red",
-                                "fc" = "#30A56C",
-                                "pvalue" = "#2380CD",
-                                "none" = "black")) +
-  geom_vline(xintercept = c(-lfcCutoff, lfcCutoff),
-             linetype = "longdash",
-             linewidth = 0.7) + 
-  geom_hline(yintercept = -log10(pCutoff),
-             linetype = "longdash",
-             linewidth = 0.7) +
-  geom_text_repel(data = . %>% head(15),
-                  mapping = aes(x = log2fc,
-                                y = -log10(pvalue),
-                                label = symbol),
-                  hjust = 1.2,
-                  color = "black",
-                  size = 4) +
-  labs(title = glue::glue("Volcano plot"),
-       x = "log2-fold-change",
-       y = "-log10(P-value)",
-       caption = paste0("Total = ",
-                        length(rownames(dge_results)),
-                        "  Sig = ",
-                        length(rownames(dge_results_sig)))) +
-  theme_bw() +
-  theme(plot.title = element_text(size = 16, hjust = 0.5),
-        axis.title = element_text(size = 14),
-        axis.text = element_text(size = 13),
-        legend.position = "",
-        plot.caption = element_text(size = 13,
-                                    face = "italic"))
+cat("::: panel-tabset\n")
+for (contrast in names(volcano_list)) {
+  cat(sprintf("\n## %s\n", contrast))
+  print(volcano_list[[{contrast}]])
+  cat("\n\n")
+}
+cat(":::\n")
 ```
 
 ### Heatmap
@@ -1802,46 +1911,64 @@ The heatmap is based on genes that are significantly differentially expressed in
 #| label: gg-heatmap-test
 #| echo: false
 #| warnings: false
+
+heatmap_list <- dge_results %>% 
+  imap(\(x, idx) {
+      # Most significant genes
+      topgenes <- x %>% 
+        dplyr::filter(down_up != 0) %>% 
+        dplyr::slice_head(n = 100) %>% 
+        dplyr::pull(symbol)
+      
+      ## Scale by row
+      topmat_scaled <- t(scale(t(lrpkm[topgenes,])))
+      
+      Heatmap(topmat_scaled,
+              cluster_rows = TRUE,
+              cluster_columns = TRUE,
+              # Text
+              show_row_names = FALSE,
+              show_column_names = TRUE,
+              column_title = "Heatmap of most deregulated genes",
+              column_title_gp = gpar(fontsize = 14),
+              column_names_gp = gpar(fontsize = 10),
+              column_names_rot = 45,
+              # Legend
+              heatmap_legend_param = list(title = "Expression\n(Log-RPKM)",
+                                          title_gp = gpar(fontsize = 11),
+                                          labels_gp = gpar(fontsize = 10)),
+              # Annotations
+              top_annotation = HeatmapAnnotation(df = annotations,
+                                                 col = annotation_colors,
+                                                 annotation_legend_param = list(title_gp = gpar(fontsize = 11),
+                                                                                labels_gp = gpar(fontsize = 10)),
+                                                 annotation_name_gp = gpar(fontsize = 11)),
+              # External border
+              border = TRUE,
+              border_gp = gpar(lwd = 0.5),
+              # Cell border
+              rect_gp = gpar(col = NA),
+              # Cell size
+              # width = ncol(topmat_scaled)*unit(12, "mm"), 
+              # Expression color
+              col = circlize::colorRamp2(range(topmat_scaled), c("#E4E1E3FF", "#0072B2")))
+  })
+```
+
+```{r}
+#| label: gg-heatmap-test-panel
+#| echo: false
+#| warnings: false
+#| results: asis
 #| fig.width: 10
 #| fig.height: 6
 #| fig.align: center
 
-# Most significant genes
-topgenes <- dge_results_sig$symbol[1:100]
-
-## Scale by row
-topmat_scaled <- t(scale(t(lrpkm_withoutBatch[topgenes,])))
-
-Heatmap(topmat_scaled,
-        cluster_rows = TRUE,
-        cluster_columns = TRUE,
-        # Text
-        show_row_names = FALSE,
-        show_column_names = TRUE,
-        column_title = "Heatmap of most deregulated genes",
-        column_title_gp = gpar(fontsize = 14),
-        column_names_gp = gpar(fontsize = 10),
-        column_names_rot = 45,
-        # Legend
-        heatmap_legend_param = list(title = "Expression\n(Log-RPKM)",
-                                    title_gp = gpar(fontsize = 11),
-                                    labels_gp = gpar(fontsize = 10)),
-        # Annotations
-        top_annotation = HeatmapAnnotation(df = annotations,
-                                           col = annotation_colors,
-                                           annotation_legend_param = list(title_gp = gpar(fontsize = 11),
-                                                                          labels_gp = gpar(fontsize = 10)),
-                                           annotation_name_gp = gpar(fontsize = 11)),
-        # External border
-        border = TRUE,
-        border_gp = gpar(lwd = 0.5),
-        # Cell border
-        rect_gp = gpar(col = NA),
-        # Cell size
-        width = ncol(topmat_scaled)*unit(12, "mm"), 
-        # Expression color
-        col = circlize::colorRamp2(range(topmat_scaled), c("#E4E1E3FF", "#0072B2")))
-
-# Clean the environment
-rm(list = c("topgenes", "topmat_scaled"))
+cat("::: panel-tabset\n")
+for (contrast in names(heatmap_list)) {
+  cat(sprintf("\n## %s\n", contrast))
+  print(heatmap_list[[{contrast}]])
+  cat("\n\n")
+}
+cat(":::\n")
 ```
