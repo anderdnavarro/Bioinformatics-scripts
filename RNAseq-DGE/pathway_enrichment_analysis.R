@@ -1,21 +1,19 @@
 library(qs2)
 library(openxlsx)
-library(dplyr)
-library(tidyr)
-library(purrr)
-library(edgeR)
+library(tidyverse)
 library(limma)
 library(org.Hs.eg.db)
-library(reactome.db)
-library(ReactomePA)
-library(goseq)
-library(fgsea)
-library(ggplot2)
-library(ggrepel)
+library(clusterProfiler)
+library(enrichplot)
+library(GseaVis)
+
+
+# \\\\\\\\\\\\\\\\\\\\\\\\\\ #
+# \\\\\\\ PREPARATION \\\\\\ #
+# \\\\\\\\\\\\\\\\\\\\\\\\\\ #
+
 
 # Constants ----
-lfcCutoff <- 0.5
-pCutoff <- 0.05
 prefix <- '20260616_default_protocol'
 out.dir <- 'pathway_enrichment_analysis'
 de.file <- 'default_results/20260209_default_protocol_all_contrasts_differential_expression_results_edgeR4.qs2'
@@ -55,6 +53,42 @@ idxC6 <- prepare_camera_idx(C6_genes)
 
 
 # Enrichment analysis ----
+safe_enrichGO <- possibly(\(gene_list, direction, ont) {
+    tmp <- enrichGO(
+      gene = gene_list, 
+      OrgDb = org.Hs.eg.db, 
+      keyType = "ENTREZID", 
+      ont = ont,
+      pAdjustMethod = "BH", 
+      pvalueCutoff = 1, 
+      readable = TRUE,
+      minGSSize = 10,
+      maxGSSize = 500,
+      pool = TRUE
+    )
+    tmp <- enrichplot::pairwise_termsim(tmp)
+    suppressWarnings(clusterProfiler::simplify(tmp, cutoff=0.7, by="p.adjust", select_fun=min)) %>% 
+      setReadable(OrgDb = org.Hs.eg.db, keyType="ENTREZID")
+  }, otherwise = NULL)
+safe_enricher <- possibly(\(gene_list, direction, term) {
+  enricher(gene = gene_list,
+           TERM2GENE = term,
+           pAdjustMethod = "BH",
+           pvalueCutoff = 1,
+           minGSSize = 10,
+           maxGSSize = 500) %>% 
+    setReadable(OrgDb = org.Hs.eg.db, keyType="ENTREZID")
+}, otherwise = NULL)
+enrich2tb <- function(enrichResult, direction) {
+  ont <- ifelse(enrichResult@ontology == "unknown", NA_character_, enrichResult@ontology)
+  enrichResult %>% 
+    as_tibble() %>%
+    dplyr::filter(pvalue < 0.05) %>% 
+    dplyr::mutate(GO = ont,
+                  GeneDirection = direction) %>%
+    dplyr::rename(pvalue_BH = p.adjust) %>%
+    dplyr::select(ID, GO, Description, GeneDirection,GeneRatio, BgRatio, RichFactor, FoldEnrichment, zScore, pvalue, pvalue_BH, Count, geneID)
+}
 enrichment_function <- function(de_results, contrast, mode=c("normal", "adjusted")){
   mode <- match.arg(mode)
   if(!(dir.exists(glue::glue("{out.dir}/enrichment_analysis")))){
@@ -69,129 +103,106 @@ enrichment_function <- function(de_results, contrast, mode=c("normal", "adjusted
   
   # Annotate according to pvalue
   if(mode == "normal"){
-    eGenes <- tb %>% 
-      dplyr::mutate(entrez_id = entrez_id,
-                    eGene = as.integer(pvalue < 0.05),
-                    .keep = "none") %>% 
-      tibble::deframe()
+    all_genes <- tb %>% 
+      dplyr::filter(pvalue < 0.05) %>% 
+      dplyr::pull(entrez_id) 
+    up_genes <- tb %>% 
+      dplyr::filter(pvalue < 0.05 & log2fc > 0) %>% 
+      dplyr::pull(entrez_id)
+    down_genes <- tb %>% 
+      dplyr::filter(pvalue < 0.05 & log2fc < 0) %>% 
+      dplyr::pull(entrez_id)
   } else {
-    eGenes <- tb %>% 
-      dplyr::mutate(entrez_id = entrez_id,
-                    eGene = as.integer(pvalue_BH < 0.05),
-                    .keep = "none") %>% 
-      tibble::deframe()
+    all_genes <- tb %>% 
+      dplyr::filter(pvalue_BH < 0.05) %>% 
+      dplyr::pull(entrez_id) 
+    up_genes <- tb %>% 
+      dplyr::filter(pvalue_BH < 0.05 & log2fc > 0) %>% 
+      dplyr::pull(entrez_id)
+    down_genes <- tb %>% 
+      dplyr::filter(pvalue_BH < 0.05 & log2fc < 0) %>% 
+      dplyr::pull(entrez_id)
   }
   
-  # Genes length
-  length_bias <- tb %>% 
-    dplyr::select(entrez_id, length) %>% 
-    tibble::deframe()
-  
-  # Fitting the Probability Weighting Function (PWF - goseq) 
-  pwf <- nullp(DEgenes = eGenes,
-               bias.data = length_bias,
-               plot.fit  = FALSE)
-  
-  # KEGG
-  print(glue::glue("KEGG enrichment analysis for comparison {contrast}"))
-  eKEGG <- goseq(pwf,
-                 genome = "hg38",
-                 id = "knownGene",
-                 test.cats = c("KEGG")) %>% 
-    as_tibble() %>% 
-    dplyr::rename(pvalue = over_represented_pvalue) %>% 
-    dplyr::mutate(pvalue_BH = p.adjust(pvalue, method = "BH"),
-                  pvalue_bonferroni = p.adjust(pvalue, method = "bonferroni"),
-                  category = glue::glue("hsa{category}")) %>% 
-    dplyr::left_join(kegg2paths, by = "category") %>% 
-    dplyr::select(category, path, pvalue, pvalue_BH, pvalue_bonferroni, numDEInCat, numInCat)
-  
-  # Reactome
-  print(glue::glue("Reactome enrichment analysis for comparison {contrast}"))
-  eReactome <- goseq(pwf,
-                     gene2cat = as.list(reactomeEXTID2PATHID)) %>% 
-    as_tibble() %>% 
-    dplyr::rename(pvalue = over_represented_pvalue) %>% 
-    dplyr::mutate(pvalue_BH = p.adjust(pvalue, method = "BH"),
-                  pvalue_bonferroni = p.adjust(pvalue, method = "bonferroni")) %>% 
-    dplyr::left_join(reactome2paths, by = c("category" = "DB_ID")) %>% 
-    dplyr::rename(path = path_name) %>% 
-    dplyr::select(category, path, pvalue, pvalue_BH, pvalue_bonferroni, numDEInCat, numInCat)
-  
-  # GO
-  print(glue::glue("GO enrichment analysis for comparison {contrast}"))
-  eGO <- goseq(pwf,
-               genome = "hg38",
-               id = "knownGene",
-               test.cats = c("GO:MF", "GO:BP", "GO:CC")) %>% 
-    as_tibble() %>% 
-    dplyr::rename(pvalue = over_represented_pvalue,
-                  path = term) %>% 
-    dplyr::mutate(pvalue_BH = p.adjust(pvalue, method = "BH"),
-                  pvalue_bonferroni = p.adjust(pvalue, method = "bonferroni")) %>% 
-    dplyr::select(category, path, ontology, pvalue, pvalue_BH, pvalue_bonferroni, numDEInCat, numInCat)
-  
   # MSigDB Hallmarks collection
-  print(glue::glue("MSigDB enrichment analysis for comparison {contrast}"))
-  eH_genes <- goseq(pwf,
-                    gene2cat = H_genes) %>% 
-    as_tibble() %>% 
-    dplyr::rename(pvalue = over_represented_pvalue) %>% 
-    dplyr::mutate(pvalue_BH = p.adjust(pvalue, method = "BH"),
-                  pvalue_bonferroni = p.adjust(pvalue, method = "bonferroni")) %>% 
-    dplyr::select(category, pvalue, pvalue_BH, pvalue_bonferroni, numDEInCat, numInCat)
+  eH <- imap(list(All = all_genes, Up = up_genes, Down = down_genes), \(gene_list, direction) {
+    print(glue::glue("MSigDB - Hallmarks - {direction} enrichment analysis for comparison {contrast}"))
+    safe_enricher(gene_list, direction, H_genes)
+    })
+  eH_tb <- eH %>% 
+    imap(\(x, idx) enrich2tb(x, idx)) %>% 
+    list_rbind() %>% 
+    dplyr::arrange(pvalue)
   
   # MSigDB Curated collection
-  eC2_genes <- goseq(pwf,
-                     gene2cat = C2_genes) %>% 
-    as_tibble() %>% 
-    dplyr::rename(pvalue = over_represented_pvalue) %>% 
-    dplyr::mutate(pvalue_BH = p.adjust(pvalue, method = "BH"),
-                  pvalue_bonferroni = p.adjust(pvalue, method = "bonferroni")) %>% 
-    dplyr::select(category, pvalue, pvalue_BH, pvalue_bonferroni, numDEInCat, numInCat)
+  eC2 <- imap(list(All = all_genes, Up = up_genes, Down = down_genes), \(gene_list, direction) {
+    print(glue::glue("MSigDB - Curated - {direction} enrichment analysis for comparison {contrast}"))
+    safe_enricher(gene_list, direction, C2_genes)
+  })
+  eC2_tb <- eC2 %>% 
+    imap(\(x, idx) enrich2tb(x, idx)) %>% 
+    list_rbind() %>% 
+    dplyr::arrange(pvalue)
+  
+  # GO
+  eGO <- imap(list(All = all_genes, Up = up_genes, Down = down_genes), \(gene_list, direction) {
+    map(list(MF = "MF", BP = "BP", CC = "CC"), \(ont) {
+      print(glue::glue("GO - {ont} - {direction} enrichment analysis for comparison {contrast}"))
+      safe_enrichGO(gene_list, direction, ont)
+      })
+    }) 
+  
+  eGO_tb <- eGO %>%
+    imap(\(x, idx) {
+      x %>%
+        map(\(y) {possibly(\(y, idx) enrich2tb(y, idx), otherwise = NULL)(y, idx)}) %>% 
+        list_rbind()
+    }) %>%
+    list_rbind() %>%
+    arrange(pvalue)
   
   # MSigDB Oncogenic collection
-  eC6_genes <- goseq(pwf,
-                     gene2cat = C6_genes) %>% 
-    as_tibble() %>% 
-    dplyr::rename(pvalue = over_represented_pvalue) %>% 
-    dplyr::mutate(pvalue_BH = p.adjust(pvalue, method = "BH"),
-                  pvalue_bonferroni = p.adjust(pvalue, method = "bonferroni")) %>% 
-    dplyr::select(category, pvalue, pvalue_BH, pvalue_bonferroni, numDEInCat, numInCat)
+  eC6 <- imap(list(All = all_genes, Up = up_genes, Down = down_genes), \(gene_list, direction) {
+    print(glue::glue("MSigDB - Oncogenic - {direction} enrichment analysis for comparison {contrast}"))
+    safe_enricher(gene_list, direction, C6_genes)
+  }) 
+  
+  eC6_tb <- eC6 %>% 
+    imap(\(x, idx) enrich2tb(x, idx)) %>% 
+    list_rbind() %>% 
+    dplyr::arrange(pvalue)
   
   # Summary
-  summ <- bind_rows(eKEGG %>% 
-                        dplyr::mutate(database = "KEGG"),
-                      eReactome %>% 
-                        dplyr::mutate(database = "Reactome"),
-                      eGO %>% 
-                        dplyr::mutate(database = "GO"),
-                      eH_genes %>% 
+  summ <- bind_rows(eH_tb %>% 
                         dplyr::mutate(database = "Hallmarks - MSigDB"),
-                      eC2_genes %>% 
+                    eC2_tb %>% 
                         dplyr::mutate(database = "Curated - MSigDB"),
-                      eC6_genes %>% 
+                    eGO_tb %>% 
+                      dplyr::mutate(database = "GO"),
+                    eC6_tb %>% 
                         dplyr::mutate(database = "Oncogenic - MSigDB")) %>% 
     dplyr::mutate(global_pvalue_BH = p.adjust(pvalue,
-                                              method = "BH"),
-                  global_pvalue_bonferroni = p.adjust(pvalue,
-                                                      method = "bonferroni")) %>% 
-    dplyr::filter(global_pvalue_BH < 0.05 & numInCat < 400) %>% 
-    dplyr::arrange(global_pvalue_BH) %>% 
-    dplyr::select(database, category, path, ontology, pvalue, pvalue_BH, global_pvalue_BH, pvalue_bonferroni, global_pvalue_bonferroni, numDEInCat, numInCat)
+                                              method = "BH")) %>% 
+    dplyr::filter(global_pvalue_BH < 0.05 & as.numeric(str_split_i(BgRatio, "/", 1)) < 400) %>% 
+    dplyr::arrange(pvalue) %>% 
+    dplyr::select(database, ID, GO, Description, GeneDirection, GeneRatio, BgRatio, RichFactor, FoldEnrichment, zScore, pvalue, pvalue_BH, Count, geneID)
   
   # Write the results in an excel file
   dfs_list <- list("Summary" = summ,
-                   "KEGG" = eKEGG,
-                   "Reactome" = eReactome,
-                   "GO" = eGO,
-                   "Hallmarks - MSigDB" = eH_genes,
-                   "Curated - MSigDB" = eC2_genes,
-                   "Oncogenic - MSigDB" = eC6_genes)
+                   "Hallmarks - MSigDB" = eH_tb,
+                   "Curated - MSigDB" = eC2_tb,
+                   "GO" = eGO_tb,
+                   "Oncogenic - MSigDB" = eC6_tb)
   write.xlsx(dfs_list, file = glue::glue("{out.dir}/enrichment_analysis/{prefix}_{contrast}_enrichment_analysis.xlsx"))
+  
+  return(list(H = eH,
+              C2 = eC2,
+              GO = eGO,
+              C6 = eC6))
 }
-df %>% 
-  iwalk(\(x, idx) enrichment_function(x, idx, mode="adjusted"))
+res_enrich <- df %>% 
+  imap(\(x, idx) enrichment_function(x, idx, mode="adjusted"))
+qs_save(res_enrich, file = glue::glue("pathway_enrichment_analysis/{prefix}_enrichResult.qs2"))
 
 # Camera ----
 camera_function <- function(contrast, counts){
