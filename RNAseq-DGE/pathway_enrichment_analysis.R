@@ -205,139 +205,71 @@ res_enrich <- df %>%
 qs_save(res_enrich, file = glue::glue("pathway_enrichment_analysis/{prefix}_enrichResult.qs2"))
 
 # Camera ----
+safe_camera <- possibly(\(camera_index) {
+  camera(y = cpm_camera,
+         index = camera_index,
+         design = design_matrix$design,
+         contrast = design_matrix$contr.matrix[,contrast]) %>% 
+    tibble::rownames_to_column(var = "category") %>% 
+    as_tibble() %>% 
+    dplyr::rename(pvalue = PValue,
+                  pvalue_BH = FDR,
+                  direction = Direction) %>% 
+    dplyr::filter(pvalue < 0.05) %>% 
+    dplyr::select(category, direction, pvalue, pvalue_BH, NGenes)
+}, otherwise = NULL)
 camera_function <- function(contrast, counts){
   if(!(dir.exists(glue::glue("{out.dir}/camera_analysis")))){
     dir.create(glue::glue("{out.dir}/camera_analysis"))
   }
   
   # Prepare Camera
-  cpm_camera <- cpm(counts,
+  cpm_camera <- edgeR::cpm(counts,
                     normalized.lib.sizes = TRUE,
                     log = TRUE,
                     prior.count = 3)
   rownames(cpm_camera) <- counts$genes$entrezid
   
-  # KEGG
-  print(glue::glue("KEGG camera analysis for comparison {contrast}"))
-  cameraKEGG <- camera(y = cpm_camera,
-                       index = idxKEGG,
-                       design = design_matrix$design,
-                       contrast = design_matrix$contr.matrix[,contrast]) %>% 
-    tibble::rownames_to_column(var = "category") %>% 
-    as_tibble() %>% 
-    dplyr::rename(pvalue = PValue,
-                  pvalue_BH = FDR,
-                  direction = Direction) %>% 
-    dplyr::mutate(pvalue_bonferroni = p.adjust(pvalue, method = "bonferroni")) %>% 
-    dplyr::filter(pvalue < 0.05) %>% 
-    dplyr::left_join(kegg2paths, by = "category") %>% 
-    dplyr::select(category, path, direction, pvalue, pvalue_BH, pvalue_bonferroni, NGenes)
-  
-  # Reactome
-  print(glue::glue("Reactome camera analysis for comparison {contrast}"))
-  cameraReactome <- camera(y = cpm_camera,
-                           index = idxReactome,
-                           design = design_matrix$design,
-                           contrast = design_matrix$contr.matrix[,contrast]) %>% 
-    tibble::rownames_to_column(var = "category") %>% 
-    as_tibble() %>% 
-    dplyr::rename(pvalue = PValue,
-                  pvalue_BH = FDR,
-                  direction = Direction) %>% 
-    dplyr::mutate(pvalue_bonferroni = p.adjust(pvalue, method = "bonferroni")) %>% 
-    dplyr::filter(pvalue < 0.05) %>% 
-    dplyr::left_join(reactome2paths, by = c("category" = "DB_ID")) %>% 
-    dplyr::rename(path = path_name) %>% 
-    dplyr::select(category, path, direction, pvalue, pvalue_BH, pvalue_bonferroni, NGenes)
-  
-  # GO
-  print(glue::glue("GO camera analysis for comparison {contrast}"))
-  cameraGO <- camera(y = cpm_camera,
-                     index = idxC5,
-                     design = design_matrix$design,
-                     contrast = design_matrix$contr.matrix[,contrast]) %>% 
-    tibble::rownames_to_column(var = "category") %>% 
-    as_tibble() %>% 
-    dplyr::rename(pvalue = PValue,
-                  pvalue_BH = FDR,
-                  direction = Direction) %>% 
-    dplyr::mutate(pvalue_bonferroni = p.adjust(pvalue, method = "bonferroni")) %>% 
-    dplyr::filter(pvalue < 0.05) %>% 
-    dplyr::select(category, direction, pvalue, pvalue_BH, pvalue_bonferroni, NGenes)
-  
   # MSigDB Hallmarks collection
-  print(glue::glue("MSigDB camera analysis for comparison {contrast}"))
-  cameraH <- camera(y = cpm_camera,
-                    index = idxH,
-                    design = design_matrix$design,
-                    contrast = design_matrix$contr.matrix[,contrast]) %>% 
-    tibble::rownames_to_column(var = "category") %>% 
-    as_tibble() %>% 
-    dplyr::rename(pvalue = PValue,
-                  pvalue_BH = FDR,
-                  direction = Direction) %>% 
-    dplyr::mutate(pvalue_bonferroni = p.adjust(pvalue, method = "bonferroni")) %>% 
-    dplyr::filter(pvalue < 0.05) %>% 
-    dplyr::select(category, direction, pvalue, pvalue_BH, pvalue_bonferroni, NGenes)
+  print(glue::glue("MSigDB - Hallmarks - Camera analysis for comparison {contrast}"))
+  cameraH <- safe_camera(idxH)
   
   # MSigDB Curated collection
-  cameraC2 <- camera(y = cpm_camera,
-                     index = idxC2,
-                     design = design_matrix$design,
-                     contrast = design_matrix$contr.matrix[,contrast]) %>% 
-    tibble::rownames_to_column(var = "category") %>% 
-    as_tibble() %>% 
-    dplyr::rename(pvalue = PValue,
-                  pvalue_BH = FDR,
-                  direction = Direction) %>% 
-    dplyr::mutate(pvalue_bonferroni = p.adjust(pvalue, method = "bonferroni")) %>% 
-    dplyr::filter(pvalue < 0.05) %>% 
-    dplyr::select(category, direction, pvalue, pvalue_BH, pvalue_bonferroni, NGenes)
+  print(glue::glue("MSigDB - Curated - Camera analysis for comparison {contrast}"))
+  cameraC2 <- safe_camera(idxC2)
+  
+  # GO
+  print(glue::glue("MSigDB - GO - Camera analysis for comparison {contrast}"))
+  cameraGO <- safe_camera(idxC5)
   
   # MSigDB Oncogenic collection
-  cameraC6 <- camera(y = cpm_camera,
-                     index = idxC6,
-                     design = design_matrix$design,
-                     contrast = design_matrix$contr.matrix[,contrast]) %>% 
-    tibble::rownames_to_column(var = "category") %>% 
-    as_tibble() %>% 
-    dplyr::rename(pvalue = PValue,
-                  pvalue_BH = FDR,
-                  direction = Direction) %>% 
-    dplyr::mutate(pvalue_bonferroni = p.adjust(pvalue, method = "bonferroni")) %>% 
-    dplyr::filter(pvalue < 0.05) %>% 
-    dplyr::select(category, direction, pvalue, pvalue_BH, pvalue_bonferroni, NGenes)
+  print(glue::glue("MSigDB - Oncogenic - Camera analysis for comparison {contrast}"))
+  cameraC6 <- safe_camera(idxC6)
   
   # Summary
-  summ <- bind_rows(cameraKEGG %>% 
-                        dplyr::mutate(database = "KEGG"),
-                      cameraReactome %>% 
-                        dplyr::mutate(database = "Reactome"),
-                      cameraGO %>% 
-                        dplyr::mutate(database = "GO"),
-                      cameraH %>% 
+  summ <- bind_rows(cameraH %>% 
                         dplyr::mutate(database = "Hallmarks - MSigDB"),
                       cameraC2 %>% 
                         dplyr::mutate(database = "Curated - MSigDB"),
+                    cameraGO %>% 
+                      dplyr::mutate(database = "GO"),
                       cameraC6 %>% 
                         dplyr::mutate(database = "Oncogenic - MSigDB")) %>% 
     dplyr::mutate(global_pvalue_BH = p.adjust(pvalue,
-                                              method = "BH"),
-                  global_pvalue_bonferroni = p.adjust(pvalue,
-                                                      method = "bonferroni")) %>% 
+                                              method = "BH")) %>% 
     dplyr::filter(global_pvalue_BH < 0.05 & NGenes < 400) %>% 
-    dplyr::arrange(global_pvalue_BH) %>% 
-    dplyr::select(database, category, path, direction, pvalue, pvalue_BH, global_pvalue_BH, pvalue_bonferroni, global_pvalue_bonferroni, NGenes)
+    dplyr::arrange(pvalue) %>% 
+    dplyr::select(database, category, direction, pvalue, pvalue_BH, global_pvalue_BH, NGenes)
   
   # Write the results in an excel file
   dfs_list <- list("Summary" = summ,
-                   "KEGG" = cameraKEGG,
-                   "Reactome" = cameraReactome,
-                   "GO - MSigDB" = cameraGO,
                    "Hallmarks - MSigDB" = cameraH,
                    "Curated - MSigDB" = cameraC2,
+                   "GO - MSigDB" = cameraGO,
                    "Oncogenic - MSigDB" = cameraC6)
   write.xlsx(dfs_list, file = glue::glue("{out.dir}/camera_analysis/{prefix}_{contrast}_camera_analysis.xlsx"))
+  
+  return(summ)
 }
 names(df) %>% 
   walk(\(x) camera_function(x, counts))
