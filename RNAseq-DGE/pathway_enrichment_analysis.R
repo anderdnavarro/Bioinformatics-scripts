@@ -275,6 +275,45 @@ names(df) %>%
   walk(\(x) camera_function(x, counts))
 
 # GSEA ----
+safe_gseGO <- possibly(\(gene_rank, ont, simplify.f=FALSE) {
+  tmp <- gseGO(geneList = gene_rank,
+        OrgDb = org.Hs.eg.db,
+        ont = ont,
+        minGSSize = 10,
+        maxGSSize = 500,
+        pvalueCutoff = 1,
+        pAdjustMethod = "BH",
+        method = "multilevel")
+  tmp <- enrichplot::pairwise_termsim(tmp)
+  
+  if (simplify.f) {
+    suppressWarnings(clusterProfiler::simplify(tmp, cutoff=0.7, by="p.adjust", select_fun=min)) %>%
+      setReadable(OrgDb = org.Hs.eg.db, keyType="ENTREZID")
+  } else {
+    tmp %>% 
+      setReadable(OrgDb = org.Hs.eg.db, keyType="ENTREZID")
+  }
+}, otherwise = NULL)
+safe_gsea <- possibly(\(gene_rank, term) {
+  GSEA(geneList = gene_rank,
+       TERM2GENE = term,
+       minGSSize = 10,
+       maxGSSize = 500,
+       pvalueCutoff = 1,
+       pAdjustMethod = "BH",
+       method = "multilevel") %>% 
+    setReadable(OrgDb = org.Hs.eg.db, keyType="ENTREZID")
+}, otherwise = NULL)
+gsea2tb <- function(gseaResult) {
+  ont <- ifelse(gseaResult@setType == "unknown", NA, gseaResult@setType)
+  gseaResult %>% 
+    as_tibble() %>% 
+    dplyr::filter(pvalue < 0.05) %>% 
+    dplyr::mutate(GO = ont,
+                  enrichSize = str_count(core_enrichment, "/") + 1) %>% 
+    dplyr::rename(pvalue_BH = p.adjust) %>%
+    dplyr::select(ID, GO, Description, enrichmentScore, NES, pvalue, pvalue_BH, log2err, setSize, enrichSize, leading_edge, core_enrichment)
+}
 gsea_function <- function(de_results, contrast){
   if(!(dir.exists(glue::glue("{out.dir}/gsea_analysis")))){
     dir.create(glue::glue("{out.dir}/gsea_analysis"))
@@ -284,126 +323,76 @@ gsea_function <- function(de_results, contrast){
   ranks <- de_results %>% 
     tidyr::drop_na(entrez_id) %>% 
     dplyr::distinct(entrez_id, .keep_all = TRUE) %>% 
-    dplyr::mutate(entrez_id = entrez_id,
-                  ranks = ifelse("t" %in% colnames(de_results),
-                                 t, #From fgsea, ranking using limma t-statistic:10.1101/060012
-                                 log2fc * (-log10(pvalue))), #Rank significant genes: 10.1093/bioinformatics/btr671
-                  .keep = "none") %>%  
-    dplyr::arrange(ranks) %>%
+    {
+      if ("t" %in% colnames(.)) {
+        dplyr::mutate(., entrez_id,
+                      ranks = t, #From fgsea, ranking using limma t-statistic:10.1101/060012
+                      .keep = "none")
+      } else {
+        dplyr::mutate(., entrez_id,
+                      ranks = log2fc * (-log10(pvalue)), #Rank significant genes: 10.1093/bioinformatics/btr671
+                      .keep = "none")
+      }
+    } %>% 
+    dplyr::arrange(desc(ranks)) %>%
     tibble::deframe()
   
-  # KEGG
-  print(glue::glue("KEGG GSEA analysis for comparison {contrast}"))
-  gseaKEGG <- fgseaMultilevel(pathways = idxKEGG,
-                              stats = ranks,
-                              maxSize = 500) %>% 
-    as_tibble() %>% 
-    dplyr::rename(category = pathway,
-                  pvalue = pval,
-                  pvalue_BH = padj) %>% 
-    dplyr::mutate(pvalue_bonferroni = p.adjust(pvalue, method = "bonferroni")) %>% 
-    dplyr::left_join(kegg2paths, by = "category") %>% 
-    dplyr::arrange(pvalue) %>% 
-    dplyr::select(category, path, ES, NES, pvalue, pvalue_BH, pvalue_bonferroni, log2err, size)
-  
-  # Reactome
-  print(glue::glue("Reactome GSEA analysis for comparison {contrast}"))
-  gseaReactome <- fgseaMultilevel(pathways = idxReactome,
-                                  stats = ranks,
-                                  maxSize = 500) %>% 
-    as_tibble() %>% 
-    dplyr::rename(category = pathway,
-                  pvalue = pval,
-                  pvalue_BH = padj) %>% 
-    dplyr::mutate(pvalue_bonferroni = p.adjust(pvalue, method = "bonferroni")) %>% 
-    dplyr::left_join(reactome2paths, by = c("category" = "DB_ID")) %>% 
-    dplyr::rename(path = path_name) %>% 
-    dplyr::arrange(pvalue) %>% 
-    dplyr::select(category, path, ES, NES, pvalue, pvalue_BH, pvalue_bonferroni, log2err, size)
-  
-  # GO
-  print(glue::glue("GO GSEA analysis for comparison {contrast}"))
-  gseaGO <- fgseaMultilevel(pathways = C5_genes,
-                            stats = ranks,
-                            maxSize = 500) %>% 
-    as_tibble() %>% 
-    dplyr::rename(path = pathway,
-                  pvalue = pval,
-                  pvalue_BH = padj) %>% 
-    dplyr::mutate(pvalue_bonferroni = p.adjust(pvalue, method = "bonferroni")) %>% 
-    dplyr::arrange(pvalue) %>% 
-    dplyr::select(path, ES, NES, pvalue, pvalue_BH, pvalue_bonferroni, log2err, size)
-  
   # MSigDB Hallmarks collection
-  print(glue::glue("MSigDB GSEA analysis for comparison {contrast}"))
-  gseaH <- fgseaMultilevel(pathways = H_genes,
-                           stats = ranks,
-                           maxSize = 500) %>% 
-    as_tibble() %>% 
-    dplyr::rename(path = pathway,
-                  pvalue = pval,
-                  pvalue_BH = padj) %>% 
-    dplyr::mutate(pvalue_bonferroni = p.adjust(pvalue, method = "bonferroni")) %>% 
-    dplyr::arrange(pvalue) %>% 
-    dplyr::select(path, ES, NES, pvalue, pvalue_BH, pvalue_bonferroni, log2err, size)
+  print(glue::glue("MSigDB - Hallmarks - GSEA analysis for comparison {contrast}"))
+  gseaH <- safe_gsea(ranks, H_genes)
+  gseaH_tb <- gsea2tb(gseaH)
   
   # MSigDB Curated collection
-  gseaC2 <- fgseaMultilevel(pathways = C2_genes,
-                            stats = ranks,
-                            maxSize = 500) %>% 
-    as_tibble() %>% 
-    dplyr::rename(path = pathway,
-                  pvalue = pval,
-                  pvalue_BH = padj) %>% 
-    dplyr::mutate(pvalue_bonferroni = p.adjust(pvalue, method = "bonferroni")) %>% 
-    dplyr::arrange(pvalue) %>% 
-    dplyr::select(path, ES, NES, pvalue, pvalue_BH, pvalue_bonferroni, log2err, size)
+  print(glue::glue("MSigDB - Curated - GSEA analysis for comparison {contrast}"))
+  gseaC2 <- safe_gsea(ranks, C2_genes)
+  gseaC2_tb <- gsea2tb(gseaC2)
+  
+  # GO
+  gseaGO <- map(list(MF = "MF", BP = "BP", CC = "CC"), \(ont) {
+    print(glue::glue("GO - {ont} - GSEA analysis for comparison {contrast}"))
+    safe_gseGO(ranks, ont, simplify.f = FALSE) #Simplify GO terms takes a lot of time for GSEA (I think it's because we don't filter by significant terms before simplifying)
+  }) 
+  gseaGO_tb <- gseaGO %>% 
+    map(\(x) gsea2tb(x)) %>% 
+    list_rbind() %>% 
+    dplyr::arrange(pvalue)
   
   # MSigDB Oncogenic collection
-  gseaC6 <- fgseaMultilevel(pathways = C6_genes,
-                            stats = ranks,
-                            maxSize = 500) %>% 
-    as_tibble() %>% 
-    dplyr::rename(path = pathway,
-                  pvalue = pval,
-                  pvalue_BH = padj) %>% 
-    dplyr::mutate(pvalue_bonferroni = p.adjust(pvalue, method = "bonferroni")) %>% 
-    dplyr::arrange(pvalue) %>% 
-    dplyr::select(path, ES, NES, pvalue, pvalue_BH, pvalue_bonferroni, log2err, size)
+  print(glue::glue("MSigDB - Oncogenic - GSEA analysis for comparison {contrast}"))
+  gseaC6 <- safe_gsea(ranks, C6_genes)
+  gseaC6_tb <- gsea2tb(gseaC6)
   
   # Summary
-  summ <- bind_rows(gseaKEGG %>% 
-                        dplyr::mutate(database = "KEGG"),
-                      gseaReactome %>% 
-                        dplyr::mutate(database = "Reactome"),
-                      gseaGO %>% 
-                        dplyr::mutate(database = "GO"),
-                      gseaH %>% 
+  summ <- bind_rows(gseaH_tb %>% 
                         dplyr::mutate(database = "Hallmarks - MSigDB"),
-                      gseaC2 %>% 
+                    gseaC2_tb %>% 
                         dplyr::mutate(database = "Curated - MSigDB"),
-                      gseaC6 %>% 
+                    gseaGO_tb %>% 
+                      dplyr::mutate(database = "GO"),
+                    gseaC6_tb %>% 
                         dplyr::mutate(database = "Oncogenic - MSigDB")) %>% 
     dplyr::mutate(global_pvalue_BH = p.adjust(pvalue,
-                                              method = "BH"),
-                  global_pvalue_bonferroni = p.adjust(pvalue,
-                                                      method = "bonferroni")) %>% 
-    dplyr::filter(global_pvalue_BH < 0.05 & size < 400) %>% 
-    dplyr::arrange(global_pvalue_BH) %>% 
-    dplyr::select(database, category, path, ES, NES, pvalue, pvalue_BH, global_pvalue_BH, pvalue_bonferroni, global_pvalue_bonferroni, log2err, size)
+                                              method = "BH")) %>% 
+    dplyr::filter(global_pvalue_BH < 0.05 & setSize < 400) %>% 
+    dplyr::arrange(pvalue) %>% 
+    dplyr::select(database, ID, GO, Description, enrichmentScore, NES, pvalue, pvalue_BH, global_pvalue_BH, log2err, setSize, enrichSize, leading_edge, core_enrichment) 
   
   # Write the results in an excel file
   dfs_list <- list("Summary" = summ,
-                   "KEGG" = gseaKEGG,
-                   "Reactome" = gseaReactome,
-                   "GO - MSigDB" = gseaGO,
-                   "Hallmarks - MSigDB" = gseaH,
-                   "Curated - MSigDB" = gseaC2,
-                   "Oncogenic - MSigDB" = gseaC6)
+                   "Hallmarks - MSigDB" = gseaH_tb,
+                   "Curated - MSigDB" = gseaC2_tb,
+                   "GO" = gseaGO_tb,
+                   "Oncogenic - MSigDB" = gseaC6_tb)
   write.xlsx(dfs_list, file = glue::glue("{out.dir}/gsea_analysis/{prefix}_{contrast}_gsea_analysis.xlsx"))
+  
+  return(list(H = gseaH,
+              C2 = gseaC2,
+              GO = gseaGO,
+              C6 = gseaC6))
 }
-df %>% 
-  iwalk(\(x, idx) gsea_function(x, idx))
+res_gsea <- df %>% 
+  imap(\(x, idx) gsea_function(x, idx))
+qs_save(res_gsea, file = glue::glue("pathway_enrichment_analysis/{prefix}_enrichGSEA.qs2"))
 
 ## GSEA Plots ----
 # plotEnrichment(H_genes[["HALLMARK_MYC_TARGETS_V1"]], ranks) +
