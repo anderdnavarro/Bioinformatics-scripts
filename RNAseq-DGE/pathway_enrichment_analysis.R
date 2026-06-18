@@ -39,7 +39,7 @@ prepare_camera_idx <- function(gmt.genes){
     tibble::deframe()
   
   ids2indices(gene.sets = tmp,
-                    identifiers = counts$genes$entrezid)
+              identifiers = counts$genes$entrezid)
 }
 idxH <- prepare_camera_idx(H_genes)
 idxC2 <- prepare_camera_idx(C2_genes)
@@ -174,13 +174,13 @@ enrichment_function <- function(de_results, contrast, mode=c("normal", "adjusted
   
   # Summary
   summ <- bind_rows(eH_tb %>% 
-                        dplyr::mutate(database = "Hallmarks - MSigDB"),
+                      dplyr::mutate(database = "Hallmarks - MSigDB"),
                     eC2_tb %>% 
-                        dplyr::mutate(database = "Curated - MSigDB"),
+                      dplyr::mutate(database = "Curated - MSigDB"),
                     eGO_tb %>% 
                       dplyr::mutate(database = "GO"),
                     eC6_tb %>% 
-                        dplyr::mutate(database = "Oncogenic - MSigDB")) %>% 
+                      dplyr::mutate(database = "Oncogenic - MSigDB")) %>% 
     dplyr::mutate(global_pvalue_BH = p.adjust(pvalue,
                                               method = "BH")) %>% 
     dplyr::filter(global_pvalue_BH < 0.05 & as.numeric(str_split_i(BgRatio, "/", 1)) < 400) %>% 
@@ -225,9 +225,9 @@ camera_function <- function(contrast, counts){
   
   # Prepare Camera
   cpm_camera <- edgeR::cpm(counts,
-                    normalized.lib.sizes = TRUE,
-                    log = TRUE,
-                    prior.count = 3)
+                           normalized.lib.sizes = TRUE,
+                           log = TRUE,
+                           prior.count = 3)
   rownames(cpm_camera) <- counts$genes$entrezid
   
   # MSigDB Hallmarks collection
@@ -248,13 +248,13 @@ camera_function <- function(contrast, counts){
   
   # Summary
   summ <- bind_rows(cameraH %>% 
-                        dplyr::mutate(database = "Hallmarks - MSigDB"),
-                      cameraC2 %>% 
-                        dplyr::mutate(database = "Curated - MSigDB"),
+                      dplyr::mutate(database = "Hallmarks - MSigDB"),
+                    cameraC2 %>% 
+                      dplyr::mutate(database = "Curated - MSigDB"),
                     cameraGO %>% 
                       dplyr::mutate(database = "GO"),
-                      cameraC6 %>% 
-                        dplyr::mutate(database = "Oncogenic - MSigDB")) %>% 
+                    cameraC6 %>% 
+                      dplyr::mutate(database = "Oncogenic - MSigDB")) %>% 
     dplyr::mutate(global_pvalue_BH = p.adjust(pvalue,
                                               method = "BH")) %>% 
     dplyr::filter(global_pvalue_BH < 0.05 & NGenes < 400) %>% 
@@ -364,13 +364,13 @@ gsea_function <- function(de_results, contrast){
   
   # Summary
   summ <- bind_rows(gseaH_tb %>% 
-                        dplyr::mutate(database = "Hallmarks - MSigDB"),
+                      dplyr::mutate(database = "Hallmarks - MSigDB"),
                     gseaC2_tb %>% 
-                        dplyr::mutate(database = "Curated - MSigDB"),
+                      dplyr::mutate(database = "Curated - MSigDB"),
                     gseaGO_tb %>% 
                       dplyr::mutate(database = "GO"),
                     gseaC6_tb %>% 
-                        dplyr::mutate(database = "Oncogenic - MSigDB")) %>% 
+                      dplyr::mutate(database = "Oncogenic - MSigDB")) %>% 
     dplyr::mutate(global_pvalue_BH = p.adjust(pvalue,
                                               method = "BH")) %>% 
     dplyr::filter(global_pvalue_BH < 0.05 & setSize < 400) %>% 
@@ -394,6 +394,159 @@ res_gsea <- df %>%
   imap(\(x, idx) gsea_function(x, idx))
 qs_save(res_gsea, file = glue::glue("pathway_enrichment_analysis/{prefix}_enrichGSEA.qs2"))
 
-## GSEA Plots ----
-# plotEnrichment(H_genes[["HALLMARK_MYC_TARGETS_V1"]], ranks) +
-#   labs(title = "HALLMARK_MYC_TARGETS_V1")
+
+# \\\\\\\\\\\\\\\\\\\\\\\\\\ #
+# \\\\\\\\\\ PLOTS \\\\\\\\\ #
+# \\\\\\\\\\\\\\\\\\\\\\\\\\ #
+
+
+# ORA Plots ----
+## Enrichplot ----
+# More examples at: https://yulab-smu.top/biomedical-knowledge-mining-book/enrichplot.html
+### Barplot ----
+barplot(res_enrich$MUTvsWT$GO$Up$CC, #TODO - This plot is better with all genes and all ontologies together, otherwise it would be better to manually plot it. It also doesn't support data other than GO
+        x = "Count",
+        showCategory = 15,
+        # split = "ONTOLOGY"
+        )
+### Manhattan plot ----
+manhattanplot(res_enrich$MUTvsWT$GO$Up$CC, #TODO - This plot is better with all genes and all ontologies together, otherwise it would be better to manually plot it
+              color = "p.adjust",
+              size = "Count",
+              # split = "ONTOLOGY",
+              title = "GO enrichment landscape")
+
+### Gene-concept network ----
+log2fc_list <- df$MUTvsWT %>% 
+  dplyr::select(entrez_id, log2fc) %>% 
+  tibble::deframe()
+cnetplot(res_enrich$MUTvsWT$GO$Up$CC, foldChange = log2fc_list)
+
+### Heatmap-like classification ----
+heatplot(res_enrich$MUTvsWT$GO$Down$CC)
+
+### Tree plot ----
+treeplot(res_enrich$MUTvsWT$GO$Down$CC)
+
+### Semantic space ----
+ssplot(res_enrich$MUTvsWT$GO$Down$CC)
+
+### Enrichment map ----
+emapplot(res_enrich$MUTvsWT$GO$Down$CC)
+
+### Upset plot ----
+upsetplot(res_enrich$MUTvsWT$C2$Down) #TODO - Maybe filter by KEGG / Reactome before plotting
+
+### GO plot ----
+goplot(res_enrich$MUTvsWT$GO$Down$CC)
+plotGOgraph(res_enrich$MUTvsWT$GO$Down$CC)
+
+# GSEA Plots ----
+# More examples at: https://junjunlab.github.io/gseavis-manual/basic-usage.html
+## GseaVis ----
+# Quick fix to solve EntrezID - Symbol naming problem
+# Update geneList names
+original_geneList <- res_gsea$MUTvsWT$H@geneList
+geneList <- mapIds(org.Hs.eg.db, keys=names(gene_rank), column='SYMBOL', keytype='ENTREZID')
+geneList[is.na(geneList)] <- names(geneList)[is.na(geneList)]
+names(res_gsea$MUTvsWT$H@geneList) <- geneList
+# Update geneSets names
+original_geneSets <- res_gsea$MUTvsWT$H@geneSets
+geneSets <- map(res_gsea$MUTvsWT$H@geneSets, \(x) {
+  tmp <- mapIds(org.Hs.eg.db, keys=x, column='SYMBOL', keytype='ENTREZID')
+  tmp[is.na(tmp)] <- names(tmp)[is.na(tmp)]
+  })
+res_gsea$MUTvsWT$H@geneSets <- geneSets
+### Classic plot ----
+example_genes <- c("POLD1", "LMNB1")
+#### Old
+gseaNb(object = res_gsea$MUTvsWT$H,
+       geneSetID = "HALLMARK_E2F_TARGETS",
+       addGene = example_genes,
+       newGsea = FALSE,
+       addPval = TRUE,
+       pvalX = 0.1,
+       pvalY = 0.4,
+       pHjust = 0,
+       pCol = 'black',
+       arrowType = 'open',
+       rmSegment = FALSE,
+       geneCol = 'black')
+
+#### New
+gseaNb(object = res_gsea$MUTvsWT$H,
+       geneSetID = "HALLMARK_E2F_TARGETS",
+       addGene = example_genes,
+       newGsea = TRUE,
+       rm.newGsea.ticks = FALSE,
+       addPval = TRUE,
+       pvalX = 0.1,
+       pvalY = 0.4,
+       pHjust = 0,
+       pCol = 'black',
+       arrowType = 'open',
+       rmSegment = FALSE,
+       geneCol = 'black')
+
+#### Multiple terms together
+gseaNb(object = res_gsea$MUTvsWT$H,
+       geneSetID = c("HALLMARK_E2F_TARGETS", "HALLMARK_MYC_TARGETS_V1", "HALLMARK_DNA_REPAIR"),
+       newGsea = FALSE)
+
+gseaNb(object = res_gsea$MUTvsWT$H,
+       geneSetID = c("HALLMARK_E2F_TARGETS", "HALLMARK_MYC_TARGETS_V1", "HALLMARK_DNA_REPAIR"),
+       newGsea = TRUE,
+       rmHt = TRUE,
+       rm.newGsea.ticks = FALSE)
+
+#### Expression heatmap
+expr <- tibble::rownames_to_column(as.data.frame(edgeR::rpkm(counts$counts, 
+                                                            log = TRUE, 
+                                                            prior.count = 3, 
+                                                            normalized.lib.sizes = TRUE,
+                                                            gene.length = counts$genes$length)),
+                                   var = "gene_name")
+expr$gene_name <- mapIds(org.Hs.eg.db, keys=expr$gene_name, column='SYMBOL', keytype='ENTREZID')
+gseaNb(object = res_gsea$MUTvsWT$H,
+       geneSetID = "HALLMARK_E2F_TARGETS",
+       addGene = example_genes,
+       newGsea = TRUE,
+       rm.newGsea.ticks = FALSE,
+       addPval = TRUE,
+       pvalX = 0.1,
+       pvalY = 0.4,
+       pHjust = 0,
+       pCol = 'black',
+       arrowType = 'open',
+       rmSegment = FALSE,
+       geneCol = 'black',
+       add.geneExpHt = TRUE,
+       exp = expr)
+
+#### A single term in multiple conditions
+GSEAmultiGP(gsea_list = list(res_gsea$MUTvsWT$H, res_gsea$MUTvsWT$H),
+            geneSetID = "HALLMARK_E2F_TARGETS",
+            exp_name = c("test1", "test2"))
+
+### Dotplot ----
+dotplotGsea(data = res_gsea$MUTvsWT$H,
+            topn = 5)
+
+## Enrichplot ----
+# More examples at: https://yulab-smu.top/biomedical-knowledge-mining-book/enrichplot.html
+### Classic plot ----
+gseaplot2(res_gsea$MUTvsWT$H,
+          title = "HALLMARK_E2F_TARGETS",
+          geneSetID = "HALLMARK_E2F_TARGETS")
+#### To extract plot information
+gsearank(res_gsea$MUTvsWT$H, 1, output = "table")
+
+### Ridgeplot ----
+ridgeplot(res_gsea$MUTvsWT$H) + #TODO - Write my own ridgeplot using log2fc only
+  labs(x = "Rank score") #t or log2fc*-log10(pvalue)
+
+### Upset plot ----
+upsetplot(res_gsea$MUTvsWT$C2) #TODO - log2FC boxplot doesn't work, I think it's because I don't use log2FC for ranking
+
+### GO plot ----
+plotGOgraph(res_gsea$MUTvsWT$GO$CC)
