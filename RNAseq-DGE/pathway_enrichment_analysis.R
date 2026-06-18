@@ -205,7 +205,7 @@ res_enrich <- df %>%
 qs_save(res_enrich, file = glue::glue("pathway_enrichment_analysis/{prefix}_enrichResult.qs2"))
 
 # Camera ----
-safe_camera <- possibly(\(camera_index) {
+safe_camera <- possibly(\(camera_index, contrast) {
   camera(y = cpm_camera,
          index = camera_index,
          design = design_matrix$design,
@@ -232,19 +232,19 @@ camera_function <- function(contrast, counts){
   
   # MSigDB Hallmarks collection
   print(glue::glue("MSigDB - Hallmarks - Camera analysis for comparison {contrast}"))
-  cameraH <- safe_camera(idxH)
+  cameraH <- safe_camera(idxH, contrast)
   
   # MSigDB Curated collection
   print(glue::glue("MSigDB - Curated - Camera analysis for comparison {contrast}"))
-  cameraC2 <- safe_camera(idxC2)
+  cameraC2 <- safe_camera(idxC2, contrast)
   
   # GO
   print(glue::glue("MSigDB - GO - Camera analysis for comparison {contrast}"))
-  cameraGO <- safe_camera(idxC5)
+  cameraGO <- safe_camera(idxC5, contrast)
   
   # MSigDB Oncogenic collection
   print(glue::glue("MSigDB - Oncogenic - Camera analysis for comparison {contrast}"))
-  cameraC6 <- safe_camera(idxC6)
+  cameraC6 <- safe_camera(idxC6, contrast)
   
   # Summary
   summ <- bind_rows(cameraH %>% 
