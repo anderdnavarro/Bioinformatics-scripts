@@ -27,38 +27,32 @@ df <- qs_read(de.file)
 counts <- qs_read(counts.file)
 design_matrix <- qs_read(design.file)
 
-# KEGG and Reactome datasets ----
-kegg2paths <- read_delim('/Users/ander/Library/Mobile Documents/com~apple~CloudDocs/Protocolos/RNAseq/databases/KEGG/kegg_pathways.txt',
-                         show_col_types = FALSE,
-                         col_names = c("category", "path")) %>% 
-  dplyr::mutate(path = str_remove(path, " - Homo sapiens \\(human\\)"))
-kegg2genes <- read_delim('/Users/ander/Library/Mobile Documents/com~apple~CloudDocs/Protocolos/RNAseq/databases/KEGG/kegg_genes.txt',
-                         show_col_types = FALSE,
-                         col_names = c("category", "type", "genomic_coordinates", "genes")) %>% 
-  dplyr::select(category, genes) %>% 
-  dplyr::mutate(genes = str_split_i(genes, '[,;]', 1))
-kegg2entrez <- as.list(org.Hs.egPATH2EG)
-names(kegg2entrez) <- glue::glue("hsa{names(kegg2entrez)}")
-idxKEGG <- ids2indices(gene.sets = kegg2entrez,
-                       identifiers = counts$genes$entrezid)
-reactome2paths <- as.data.frame(reactomePATHID2NAME)
-reactome2entrez <- as.list(reactomePATHID2EXTID)
-idxReactome <- ids2indices(gene.sets = reactome2entrez,
-                           identifiers = counts$genes$entrezid)
-
 # MSigDB datasets ----
-H_genes <- readRDS("/Users/ander/Library/Mobile Documents/com~apple~CloudDocs/Protocolos/RNAseq/databases/MSigDB/Hs.h.all.v7.1.entrez.rds") #Hallmarks collection
-idxH <- ids2indices(gene.sets = H_genes,
+H_genes <- read.gmt('MSigDB/h.all.v2026.1.Hs.entrez.gmt')
+C2_genes <- read.gmt('MSigDB/c2.all.v2026.1.Hs.entrez.gmt') # Includes KEGG and Reactome
+C5_genes <- read.gmt('MSigDB/c5.all.v2026.1.Hs.entrez.gmt')
+C6_genes <- read.gmt('MSigDB/c6.all.v2026.1.Hs.entrez.gmt')
+
+# Camera index ----
+prepare_camera_idx <- function(gmt.genes){
+  tmp <- gmt.genes %>% 
+    dplyr::group_by(term) %>%
+    dplyr::summarise(genes = list(gene), .groups = "drop") %>%
+    tibble::deframe()
+  
+  ids2indices(gene.sets = tmp,
                     identifiers = counts$genes$entrezid)
-C2_genes <- readRDS("/Users/ander/Library/Mobile Documents/com~apple~CloudDocs/Protocolos/RNAseq/databases/MSigDB/Hs.c2.all.v7.1.entrez.rds") #Curated collection
-idxC2 <- ids2indices(gene.sets = C2_genes,
-                     identifiers = counts$genes$entrezid)
-C5_genes <- readRDS("/Users/ander/Library/Mobile Documents/com~apple~CloudDocs/Protocolos/RNAseq/databases/MSigDB/Hs.c5.all.v7.1.entrez.rds") #GO collection
-idxC5 <- ids2indices(gene.sets = C5_genes,
-                     identifiers = counts$genes$entrezid)
-C6_genes <- readRDS("/Users/ander/Library/Mobile Documents/com~apple~CloudDocs/Protocolos/RNAseq/databases/MSigDB/Hs.c6.all.v7.1.entrez.rds") #Oncogenic collection
-idxC6 <- ids2indices(gene.sets = C6_genes,
-                     identifiers = counts$genes$entrezid)
+}
+idxH <- prepare_camera_idx(H_genes)
+idxC2 <- prepare_camera_idx(C2_genes)
+idxC5 <- prepare_camera_idx(C5_genes)
+idxC6 <- prepare_camera_idx(C6_genes)
+
+
+# \\\\\\\\\\\\\\\\\\\\\\\\\\ #
+# \\\\\\\ ENRICHMENT \\\\\\\ #
+# \\\\\\\\\\\\\\\\\\\\\\\\\\ #
+
 
 # Enrichment analysis ----
 enrichment_function <- function(de_results, contrast, mode=c("normal", "adjusted")){
